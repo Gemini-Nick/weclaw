@@ -110,13 +110,15 @@ Config file: `~/.weclaw/config.json`
   "default_agent": "claude",
   "agents": {
     "claude": {
-      "type": "acp",
-      "command": "/usr/local/bin/claude-agent-acp",
-      "model": "sonnet"
+      "type": "cli",
+      "command": "/usr/local/bin/claude",
+      "model": "sonnet",
+      "args": ["--dangerously-skip-permissions"]
     },
     "codex": {
       "type": "cli",
-      "command": "/usr/local/bin/codex"
+      "command": "/usr/local/bin/codex",
+      "args": ["--skip-git-repo-check"]
     },
     "openclaw": {
       "type": "http",

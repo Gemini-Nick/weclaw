@@ -15,6 +15,7 @@ import (
 type CLIAgent struct {
 	name         string
 	command      string
+	args         []string // extra args from config
 	model        string
 	systemPrompt string
 	mu           sync.Mutex
@@ -23,8 +24,9 @@ type CLIAgent struct {
 
 // CLIAgentConfig holds configuration for a CLI agent.
 type CLIAgentConfig struct {
-	Name         string // agent name for logging, e.g. "claude", "codex"
-	Command      string // path to binary
+	Name         string   // agent name for logging, e.g. "claude", "codex"
+	Command      string   // path to binary
+	Args         []string // extra args (e.g. ["--dangerously-skip-permissions"])
 	Model        string
 	SystemPrompt string
 }
@@ -34,6 +36,7 @@ func NewCLIAgent(cfg CLIAgentConfig) *CLIAgent {
 	return &CLIAgent{
 		name:         cfg.Name,
 		command:      cfg.Command,
+		args:         cfg.Args,
 		model:        cfg.Model,
 		systemPrompt: cfg.SystemPrompt,
 		sessions:     make(map[string]string),
@@ -70,7 +73,7 @@ func (a *CLIAgent) Chat(ctx context.Context, conversationID string, message stri
 
 // chatClaude uses claude -p with stream-json to get structured output and session persistence.
 func (a *CLIAgent) chatClaude(ctx context.Context, conversationID string, message string) (string, error) {
-	args := []string{"-p", message, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"}
+	args := []string{"-p", message, "--output-format", "stream-json", "--verbose"}
 
 	if a.model != "" {
 		args = append(args, "--model", a.model)
@@ -78,6 +81,8 @@ func (a *CLIAgent) chatClaude(ctx context.Context, conversationID string, messag
 	if a.systemPrompt != "" {
 		args = append(args, "--append-system-prompt", a.systemPrompt)
 	}
+	// Append extra args from config (e.g. --dangerously-skip-permissions)
+	args = append(args, a.args...)
 
 	// Resume existing session for multi-turn conversation
 	a.mu.Lock()
@@ -169,10 +174,12 @@ func (a *CLIAgent) chatClaude(ctx context.Context, conversationID string, messag
 
 // chatCodex handles codex CLI invocation using "codex exec".
 func (a *CLIAgent) chatCodex(ctx context.Context, message string) (string, error) {
-	args := []string{"exec", "--skip-git-repo-check", message}
+	args := []string{"exec", message}
 	if a.model != "" {
 		args = append(args, "--model", a.model)
 	}
+	// Append extra args from config (e.g. --skip-git-repo-check)
+	args = append(args, a.args...)
 
 	log.Printf("[cli] running codex exec (command=%s)", a.command)
 	cmd := exec.CommandContext(ctx, a.command, args...)

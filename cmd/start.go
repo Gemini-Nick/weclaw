@@ -236,6 +236,7 @@ func createAgentByName(ctx context.Context, cfg *config.Config, name string) age
 		ag := agent.NewCLIAgent(agent.CLIAgentConfig{
 			Name:         name,
 			Command:      agCfg.Command,
+			Args:         agCfg.Args,
 			Model:        agCfg.Model,
 			SystemPrompt: agCfg.SystemPrompt,
 		})
