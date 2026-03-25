@@ -168,24 +168,62 @@ func (h *Handler) resolveAlias(name string) string {
 	return name
 }
 
-// parseCommand checks if text starts with "/" or "@" followed by an agent name.
-// Returns (agentName, actualMessage). Aliases are resolved automatically.
-// If no command prefix, returns ("", originalText).
-func (h *Handler) parseCommand(text string) (string, string) {
+// parseCommand checks if text starts with "/" or "@" followed by agent name(s).
+// Supports multiple agents: "@cc @cx hello" returns (["claude","codex"], "hello").
+// Returns (agentNames, actualMessage). Aliases are resolved automatically.
+// If no command prefix, returns (nil, originalText).
+func (h *Handler) parseCommand(text string) ([]string, string) {
 	if !strings.HasPrefix(text, "/") && !strings.HasPrefix(text, "@") {
-		return "", text
+		return nil, text
 	}
 
-	// Strip leading "/" or "@"
-	rest := text[1:]
-	idx := strings.IndexByte(rest, ' ')
-	if idx <= 0 {
-		// Just "/codex" or "@codex" with no message
-		return h.resolveAlias(rest), ""
+	// Parse consecutive @name or /name tokens from the start
+	var names []string
+	rest := text
+	for {
+		rest = strings.TrimSpace(rest)
+		if !strings.HasPrefix(rest, "/") && !strings.HasPrefix(rest, "@") {
+			break
+		}
+
+		// Strip prefix
+		after := rest[1:]
+		idx := strings.IndexAny(after, " /@")
+		var token string
+		if idx < 0 {
+			// Rest is just the name, no message
+			token = after
+			rest = ""
+		} else if after[idx] == '/' || after[idx] == '@' {
+			// Next token is another @name or /name
+			token = after[:idx]
+			rest = after[idx:]
+		} else {
+			// Space — name ends here
+			token = after[:idx]
+			rest = strings.TrimSpace(after[idx+1:])
+		}
+
+		if token != "" {
+			names = append(names, h.resolveAlias(token))
+		}
+
+		if rest == "" {
+			break
+		}
 	}
 
-	name := h.resolveAlias(rest[:idx])
-	return name, strings.TrimSpace(rest[idx+1:])
+	// Deduplicate names preserving order
+	seen := make(map[string]bool)
+	unique := names[:0]
+	for _, n := range names {
+		if !seen[n] {
+			seen[n] = true
+			unique = append(unique, n)
+		}
+	}
+
+	return unique, rest
 }
 
 // HandleMessage processes a single incoming message.
@@ -266,81 +304,147 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		return
 	}
 
-	// Route: "/agentname message" -> specific agent, otherwise -> default
-	agentName, message := h.parseCommand(text)
+	// Route: "/agentname message" or "@agent1 @agent2 message" -> specific agent(s)
+	agentNames, message := h.parseCommand(text)
 
-	var reply string
-	var err error
-	needsAgent := false
+	// No command prefix -> send to default agent
+	if len(agentNames) == 0 {
+		h.sendToDefaultAgent(ctx, client, msg, text, clientID)
+		return
+	}
 
-	if agentName != "" {
-		if message == "" {
-			// "/xxx" with no message:
-			// - If it's a known agent -> switch default
-			// - Otherwise -> forward entire text to default agent (e.g. /status for openclaw)
-			if h.isKnownAgent(agentName) {
-				reply = h.switchDefault(ctx, agentName)
-			} else {
-				agentName = ""
-				needsAgent = true
+	// No message -> switch default agent (only first name)
+	if message == "" {
+		if len(agentNames) == 1 && h.isKnownAgent(agentNames[0]) {
+			reply := h.switchDefault(ctx, agentNames[0])
+			if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+				log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
 			}
+		} else if len(agentNames) == 1 && !h.isKnownAgent(agentNames[0]) {
+			// Unknown agent -> forward to default
+			h.sendToDefaultAgent(ctx, client, msg, text, clientID)
 		} else {
-			// "/xxx message":
-			// - If it's a known agent -> route to it
-			// - Otherwise -> forward entire text to default agent
-			if !h.isKnownAgent(agentName) {
-				agentName = ""
-				needsAgent = true
-			} else {
-				needsAgent = true
+			reply := "Usage: specify one agent to switch, or add a message to broadcast"
+			if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+				log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
 			}
+		}
+		return
+	}
+
+	// Filter to known agents; if single unknown agent -> forward to default
+	var knownNames []string
+	for _, name := range agentNames {
+		if h.isKnownAgent(name) {
+			knownNames = append(knownNames, name)
+		}
+	}
+	if len(knownNames) == 0 {
+		// No known agents -> forward entire text to default agent
+		h.sendToDefaultAgent(ctx, client, msg, text, clientID)
+		return
+	}
+
+	// Send typing indicator
+	go func() {
+		if typingErr := SendTypingState(ctx, client, msg.FromUserID, msg.ContextToken); typingErr != nil {
+			log.Printf("[handler] failed to send typing state: %v", typingErr)
+		}
+	}()
+
+	if len(knownNames) == 1 {
+		// Single agent
+		h.sendToNamedAgent(ctx, client, msg, knownNames[0], message, clientID)
+	} else {
+		// Multi-agent broadcast: parallel dispatch, send replies as they arrive
+		h.broadcastToAgents(ctx, client, msg, knownNames, message)
+	}
+}
+
+// sendToDefaultAgent sends the message to the default agent and replies.
+func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, text, clientID string) {
+	go func() {
+		if typingErr := SendTypingState(ctx, client, msg.FromUserID, msg.ContextToken); typingErr != nil {
+			log.Printf("[handler] failed to send typing state: %v", typingErr)
+		}
+	}()
+
+	ag := h.getDefaultAgent()
+	var reply string
+	if ag != nil {
+		var err error
+		reply, err = h.chatWithAgent(ctx, ag, msg.FromUserID, text)
+		if err != nil {
+			reply = fmt.Sprintf("Error: %v", err)
 		}
 	} else {
-		needsAgent = true
+		log.Printf("[handler] agent not ready, using echo mode for %s", msg.FromUserID)
+		reply = "[echo] " + text
 	}
 
-	if needsAgent {
-		// Send typing indicator via iLink sendtyping API (async, non-blocking)
-		go func() {
-			if typingErr := SendTypingState(ctx, client, msg.FromUserID, msg.ContextToken); typingErr != nil {
-				log.Printf("[handler] failed to send typing state: %v", typingErr)
-			}
-		}()
+	h.sendReplyWithMedia(ctx, client, msg, reply, clientID)
+}
 
-		if agentName != "" {
-			// Route to named agent (start on demand if needed)
-			ag, agErr := h.getAgent(ctx, agentName)
-			if agErr != nil {
-				log.Printf("[handler] agent %q not available: %v", agentName, agErr)
-				reply = fmt.Sprintf("Agent %q is not available: %v", agentName, agErr)
-			} else {
-				reply, err = h.chatWithAgent(ctx, ag, msg.FromUserID, message)
-			}
-		} else {
-			// Default agent
-			ag := h.getDefaultAgent()
-			if ag != nil {
-				reply, err = h.chatWithAgent(ctx, ag, msg.FromUserID, text)
-			} else {
-				log.Printf("[handler] agent not ready, using echo mode for %s", msg.FromUserID)
-				reply = "[echo] " + text
-			}
-		}
+// sendToNamedAgent sends the message to a specific agent and replies.
+func (h *Handler) sendToNamedAgent(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, name, message, clientID string) {
+	ag, agErr := h.getAgent(ctx, name)
+	if agErr != nil {
+		log.Printf("[handler] agent %q not available: %v", name, agErr)
+		reply := fmt.Sprintf("Agent %q is not available: %v", name, agErr)
+		SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		return
 	}
 
+	reply, err := h.chatWithAgent(ctx, ag, msg.FromUserID, message)
 	if err != nil {
 		reply = fmt.Sprintf("Error: %v", err)
 	}
+	h.sendReplyWithMedia(ctx, client, msg, reply, clientID)
+}
 
-	// Extract image URLs from markdown before converting to plain text
+// broadcastToAgents sends the message to multiple agents in parallel.
+// Each reply is sent as a separate message with the agent name prefix.
+func (h *Handler) broadcastToAgents(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, names []string, message string) {
+	type result struct {
+		name  string
+		reply string
+	}
+
+	ch := make(chan result, len(names))
+
+	for _, name := range names {
+		go func(n string) {
+			ag, err := h.getAgent(ctx, n)
+			if err != nil {
+				ch <- result{name: n, reply: fmt.Sprintf("Error: %v", err)}
+				return
+			}
+			reply, err := h.chatWithAgent(ctx, ag, msg.FromUserID, message)
+			if err != nil {
+				ch <- result{name: n, reply: fmt.Sprintf("Error: %v", err)}
+				return
+			}
+			ch <- result{name: n, reply: reply}
+		}(name)
+	}
+
+	// Send replies as they arrive
+	for range names {
+		r := <-ch
+		reply := fmt.Sprintf("[%s] %s", r.name, r.reply)
+		clientID := NewClientID()
+		h.sendReplyWithMedia(ctx, client, msg, reply, clientID)
+	}
+}
+
+// sendReplyWithMedia sends a text reply and any extracted image URLs.
+func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, reply, clientID string) {
 	imageURLs := ExtractImageURLs(reply)
 
-	// Send final text reply with same clientID (completes the typing → finish flow)
 	if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
 	}
 
-	// Send extracted images as separate media messages
 	for _, imgURL := range imageURLs {
 		if err := SendMediaFromURL(ctx, client, msg.FromUserID, imgURL, msg.ContextToken); err != nil {
 			log.Printf("[handler] failed to send image to %s: %v", msg.FromUserID, err)
@@ -490,10 +594,11 @@ func (h *Handler) buildStatus() string {
 
 func buildHelpText() string {
 	return `Available commands:
-/agentname - Switch default agent
-/agentname message - Send message to a specific agent
-/new or /clear - Start a new session (clears conversation history)
-/cwd /path/to/project - Switch workspace directory
+@agent or /agent - Switch default agent
+@agent msg or /agent msg - Send to a specific agent
+@a @b msg - Broadcast to multiple agents
+/new or /clear - Start a new session
+/cwd /path - Switch workspace directory
 /info - Show current agent info
 /help - Show this help message
 
