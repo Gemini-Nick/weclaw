@@ -35,6 +35,7 @@ type Handler struct {
 	defaultName   string
 	agents        map[string]agent.Agent // name -> running agent
 	agentMetas    []AgentMeta            // all configured agents (for /status)
+	agentWorkDirs map[string]string      // agent name -> configured/runtime cwd
 	customAliases map[string]string      // custom alias -> agent name (from config)
 	factory       AgentFactory
 	saveDefault   SaveDefaultFunc
@@ -46,9 +47,10 @@ type Handler struct {
 // NewHandler creates a new message handler.
 func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 	return &Handler{
-		agents:      make(map[string]agent.Agent),
-		factory:     factory,
-		saveDefault: saveDefault,
+		agents:        make(map[string]agent.Agent),
+		agentWorkDirs: make(map[string]string),
+		factory:       factory,
+		saveDefault:   saveDefault,
 	}
 }
 
@@ -80,6 +82,17 @@ func (h *Handler) SetAgentMetas(metas []AgentMeta) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.agentMetas = metas
+}
+
+// SetAgentWorkDirs sets the configured working directory for each agent.
+func (h *Handler) SetAgentWorkDirs(workDirs map[string]string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.agentWorkDirs = make(map[string]string, len(workDirs))
+	for name, dir := range workDirs {
+		h.agentWorkDirs[name] = dir
+	}
 }
 
 // SetDefaultAgent sets the default agent (already started).
@@ -403,6 +416,10 @@ func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, 
 		}
 	}()
 
+	h.mu.RLock()
+	defaultName := h.defaultName
+	h.mu.RUnlock()
+
 	ag := h.getDefaultAgent()
 	var reply string
 	if ag != nil {
@@ -416,7 +433,7 @@ func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, 
 		reply = "[echo] " + text
 	}
 
-	h.sendReplyWithMedia(ctx, client, msg, reply, clientID)
+	h.sendReplyWithMedia(ctx, client, msg, defaultName, reply, clientID)
 }
 
 // sendToNamedAgent sends the message to a specific agent and replies.
@@ -433,7 +450,7 @@ func (h *Handler) sendToNamedAgent(ctx context.Context, client *ilink.Client, ms
 	if err != nil {
 		reply = fmt.Sprintf("Error: %v", err)
 	}
-	h.sendReplyWithMedia(ctx, client, msg, reply, clientID)
+	h.sendReplyWithMedia(ctx, client, msg, name, reply, clientID)
 }
 
 // broadcastToAgents sends the message to multiple agents in parallel.
@@ -467,13 +484,33 @@ func (h *Handler) broadcastToAgents(ctx context.Context, client *ilink.Client, m
 		r := <-ch
 		reply := fmt.Sprintf("[%s] %s", r.name, r.reply)
 		clientID := NewClientID()
-		h.sendReplyWithMedia(ctx, client, msg, reply, clientID)
+		h.sendReplyWithMedia(ctx, client, msg, r.name, reply, clientID)
 	}
 }
 
 // sendReplyWithMedia sends a text reply and any extracted image URLs.
-func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, reply, clientID string) {
+func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, agentName, reply, clientID string) {
 	imageURLs := ExtractImageURLs(reply)
+	attachmentPaths := extractLocalAttachmentPaths(reply)
+	allowedRoots := h.allowedAttachmentRoots(agentName)
+
+	var sentPaths []string
+	var failedPaths []string
+	for _, attachmentPath := range attachmentPaths {
+		if !isAllowedAttachmentPath(attachmentPath, allowedRoots) {
+			log.Printf("[handler] rejected attachment outside allowed roots for agent %q: %s", agentName, attachmentPath)
+			failedPaths = append(failedPaths, attachmentPath)
+			continue
+		}
+		if err := SendMediaFromPath(ctx, client, msg.FromUserID, attachmentPath, msg.ContextToken); err != nil {
+			log.Printf("[handler] failed to send attachment to %s: %v", msg.FromUserID, err)
+			failedPaths = append(failedPaths, attachmentPath)
+			continue
+		}
+		sentPaths = append(sentPaths, attachmentPath)
+	}
+
+	reply = rewriteReplyWithAttachmentResults(reply, sentPaths, failedPaths)
 
 	if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
@@ -484,6 +521,20 @@ func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, 
 			log.Printf("[handler] failed to send image to %s: %v", msg.FromUserID, err)
 		}
 	}
+}
+
+func (h *Handler) allowedAttachmentRoots(agentName string) []string {
+	roots := []string{defaultAttachmentWorkspace()}
+
+	h.mu.RLock()
+	agentDir := h.agentWorkDirs[agentName]
+	h.mu.RUnlock()
+
+	if agentDir != "" {
+		roots = append(roots, agentDir)
+	}
+
+	return roots
 }
 
 // chatWithAgent sends a message to an agent and returns the reply, with logging.
@@ -604,6 +655,12 @@ func (h *Handler) handleCwd(trimmed string) string {
 		ag.SetCwd(absPath)
 		log.Printf("[handler] updated cwd for agent %s: %s", name, absPath)
 	}
+
+	h.mu.Lock()
+	for name := range agents {
+		h.agentWorkDirs[name] = absPath
+	}
+	h.mu.Unlock()
 
 	return fmt.Sprintf("cwd: %s", absPath)
 }
