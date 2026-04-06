@@ -39,9 +39,9 @@ type Handler struct {
 	customAliases map[string]string      // custom alias -> agent name (from config)
 	factory       AgentFactory
 	saveDefault   SaveDefaultFunc
-	contextTokens sync.Map   // map[userID]contextToken
-	saveDir       string     // directory to save images/files to
-	seenMsgs      sync.Map   // map[int64]time.Time — dedup by message_id
+	contextTokens sync.Map // map[userID]contextToken
+	saveDir       string   // directory to save images/files to
+	seenMsgs      sync.Map // map[int64]time.Time — dedup by message_id
 }
 
 // NewHandler creates a new message handler.
@@ -277,6 +277,8 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		go h.cleanSeenMsgs()
 	}
 
+	log.Printf("[handler] incoming message id=%d from=%s items=%s", msg.MessageID, msg.FromUserID, describeMessageItems(msg))
+
 	// Extract text from item list (text message or voice transcription)
 	text := extractText(msg)
 	if text == "" {
@@ -286,9 +288,12 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		}
 	}
 	if text == "" {
-		// Check for image message
 		if img := extractImage(msg); img != nil && h.saveDir != "" {
 			h.handleImageSave(ctx, client, msg, img)
+			return
+		}
+		if file := extractFile(msg); file != nil && h.saveDir != "" {
+			h.handleFileSave(ctx, client, msg, file)
 			return
 		}
 		log.Printf("[handler] received non-text message from %s, skipping", msg.FromUserID)
@@ -707,8 +712,17 @@ func extractText(msg ilink.WeixinMessage) string {
 
 func extractImage(msg ilink.WeixinMessage) *ilink.ImageItem {
 	for _, item := range msg.ItemList {
-		if item.Type == ilink.ItemTypeImage && item.ImageItem != nil {
+		if item.ImageItem != nil {
 			return item.ImageItem
+		}
+	}
+	return nil
+}
+
+func extractFile(msg ilink.WeixinMessage) *ilink.FileItem {
+	for _, item := range msg.ItemList {
+		if item.FileItem != nil {
+			return item.FileItem
 		}
 	}
 	return nil
@@ -755,27 +769,12 @@ func (h *Handler) handleImageSave(ctx context.Context, client *ilink.Client, msg
 	// Generate filename with timestamp
 	ts := time.Now().Format("20060102-150405")
 	fileName := fmt.Sprintf("%s%s", ts, ext)
-	filePath := filepath.Join(h.saveDir, fileName)
-
-	// Ensure save directory exists
-	if err := os.MkdirAll(h.saveDir, 0o755); err != nil {
-		log.Printf("[handler] failed to create save dir: %v", err)
-		return
-	}
-
-	// Write image file
-	if err := os.WriteFile(filePath, data, 0o644); err != nil {
-		log.Printf("[handler] failed to write image: %v", err)
+	filePath, err := saveIncomingMediaFile(h.saveDir, fileName, data)
+	if err != nil {
+		log.Printf("[handler] failed to persist image: %v", err)
 		reply := fmt.Sprintf("Failed to save image: %v", err)
 		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
 		return
-	}
-
-	// Write sidecar file
-	sidecarPath := filePath + ".sidecar.md"
-	sidecarContent := fmt.Sprintf("---\nid: %s\n---\n", uuid.New().String())
-	if err := os.WriteFile(sidecarPath, []byte(sidecarContent), 0o644); err != nil {
-		log.Printf("[handler] failed to write sidecar: %v", err)
 	}
 
 	log.Printf("[handler] saved image to %s (%d bytes)", filePath, len(data))
@@ -783,6 +782,93 @@ func (h *Handler) handleImageSave(ctx context.Context, client *ilink.Client, msg
 	if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
 	}
+	h.dispatchSavedMediaToDefaultAgent(ctx, client, msg, "图片", filePath)
+}
+
+func (h *Handler) handleFileSave(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, file *ilink.FileItem) {
+	clientID := NewClientID()
+	log.Printf("[handler] received file from %s, saving to %s", msg.FromUserID, h.saveDir)
+
+	if file.Media == nil || file.Media.EncryptQueryParam == "" {
+		log.Printf("[handler] file has no media info from %s", msg.FromUserID)
+		_ = SendTextReply(ctx, client, msg.FromUserID, "Failed to save file: missing media info", msg.ContextToken, clientID)
+		return
+	}
+
+	data, err := DownloadFileFromCDN(ctx, file.Media.EncryptQueryParam, file.Media.AESKey)
+	if err != nil {
+		log.Printf("[handler] failed to download file from %s: %v", msg.FromUserID, err)
+		_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("Failed to save file: %v", err), msg.ContextToken, clientID)
+		return
+	}
+
+	fileName := sanitizeIncomingFileName(file.FileName)
+	filePath, err := saveIncomingMediaFile(h.saveDir, fileName, data)
+	if err != nil {
+		log.Printf("[handler] failed to persist file: %v", err)
+		_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("Failed to save file: %v", err), msg.ContextToken, clientID)
+		return
+	}
+
+	log.Printf("[handler] saved file to %s (%d bytes)", filePath, len(data))
+	if err := SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("Saved: %s", filepath.Base(filePath)), msg.ContextToken, clientID); err != nil {
+		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+	}
+	h.dispatchSavedMediaToDefaultAgent(ctx, client, msg, "文件", filePath)
+}
+
+func (h *Handler) dispatchSavedMediaToDefaultAgent(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, mediaType, path string) {
+	prompt := fmt.Sprintf("收到一个来自微信的%s，已保存到本地。请基于该文件继续处理。\n%s", mediaType, path)
+	h.sendToDefaultAgent(ctx, client, msg, prompt, NewClientID())
+}
+
+func saveIncomingMediaFile(dir, fileName string, data []byte) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+
+	filePath := filepath.Join(dir, fileName)
+	if err := os.WriteFile(filePath, data, 0o644); err != nil {
+		return "", err
+	}
+
+	sidecarPath := filePath + ".sidecar.md"
+	sidecarContent := fmt.Sprintf("---\nid: %s\n---\n", uuid.New().String())
+	if err := os.WriteFile(sidecarPath, []byte(sidecarContent), 0o644); err != nil {
+		log.Printf("[handler] failed to write sidecar: %v", err)
+	}
+
+	return filePath, nil
+}
+
+func sanitizeIncomingFileName(name string) string {
+	name = strings.TrimSpace(filepath.Base(name))
+	name = strings.ReplaceAll(name, string(os.PathSeparator), "_")
+	name = strings.ReplaceAll(name, "/", "_")
+	if name == "" || name == "." {
+		name = time.Now().Format("20060102-150405") + ".bin"
+	}
+	return name
+}
+
+func describeMessageItems(msg ilink.WeixinMessage) string {
+	if len(msg.ItemList) == 0 {
+		return "[]"
+	}
+
+	parts := make([]string, 0, len(msg.ItemList))
+	for idx, item := range msg.ItemList {
+		parts = append(parts, fmt.Sprintf("{idx:%d type:%d text:%t image:%t voice:%t video:%t file:%t}",
+			idx,
+			item.Type,
+			item.TextItem != nil,
+			item.ImageItem != nil,
+			item.VoiceItem != nil,
+			item.VideoItem != nil,
+			item.FileItem != nil,
+		))
+	}
+	return "[" + strings.Join(parts, " ") + "]"
 }
 
 func detectImageExt(data []byte) string {

@@ -18,7 +18,7 @@ import (
 	"github.com/fastclaw-ai/weclaw/ilink"
 )
 
-const cdnBaseURL = "https://novac2c.cdn.weixin.qq.com/c2c"
+var cdnBaseURL = "https://novac2c.cdn.weixin.qq.com/c2c"
 
 // UploadedFile holds the result of a CDN upload.
 type UploadedFile struct {
