@@ -6,15 +6,32 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 // Config holds the application configuration.
 type Config struct {
-	DefaultAgent string                 `json:"default_agent"`
-	APIAddr      string                 `json:"api_addr,omitempty"`
-	SaveDir      string                 `json:"save_dir,omitempty"`
-	PersonaDir   string                 `json:"persona_dir,omitempty"`
-	Agents       map[string]AgentConfig `json:"agents"`
+	DefaultAgent                 string                 `json:"default_agent"`
+	APIAddr                      string                 `json:"api_addr,omitempty"`
+	SaveDir                      string                 `json:"save_dir,omitempty"`
+	PersonaDir                   string                 `json:"persona_dir,omitempty"`
+	VoiceInputModeDefault        string                 `json:"voice_input_mode_default,omitempty"`
+	ArchiveToolEnabled           bool                   `json:"archive_tool_enabled,omitempty"`
+	ObsidianEnabled              bool                   `json:"obsidian_enabled,omitempty"`
+	ObsidianFormalWriteEnabled   bool                   `json:"obsidian_formal_write_enabled,omitempty"`
+	ObsidianVaultDir             string                 `json:"obsidian_vault_dir,omitempty"`
+	ObsidianVaultName            string                 `json:"obsidian_vault_name,omitempty"`
+	ObsidianNotesDir             string                 `json:"obsidian_notes_dir,omitempty"`
+	ObsidianAssetsDir            string                 `json:"obsidian_assets_dir,omitempty"`
+	ObsidianOpenAfterArchive     bool                   `json:"obsidian_open_after_archive,omitempty"`
+	ObsidianAutoArchiveEnabled   bool                   `json:"obsidian_auto_archive_enabled,omitempty"`
+	ObsidianAutoArchiveMode      string                 `json:"obsidian_auto_archive_mode,omitempty"`
+	ObsidianArchiveWindowMinutes int                    `json:"obsidian_archive_window_minutes,omitempty"`
+	ObsidianArchiveReplyEnabled  bool                   `json:"obsidian_archive_reply_enabled,omitempty"`
+	ObsidianVoiceArchiveMode     string                 `json:"obsidian_voice_archive_mode,omitempty"`
+	ObsidianVideoArchiveMode     string                 `json:"obsidian_video_archive_mode,omitempty"`
+	AgentInputPolicy             string                 `json:"agent_input_policy,omitempty"`
+	Agents                       map[string]AgentConfig `json:"agents"`
 }
 
 // AgentConfig holds configuration for a single agent.
@@ -68,7 +85,23 @@ func BuildAliasMap(agents map[string]AgentConfig) map[string]string {
 // DefaultConfig returns an empty configuration.
 func DefaultConfig() *Config {
 	return &Config{
-		Agents: make(map[string]AgentConfig),
+		Agents:                       make(map[string]AgentConfig),
+		VoiceInputModeDefault:        "transcript_first",
+		ArchiveToolEnabled:           true,
+		ObsidianEnabled:              true,
+		ObsidianFormalWriteEnabled:   true,
+		ObsidianVaultDir:             "~/Documents/LongclawVault",
+		ObsidianVaultName:            "LongclawVault",
+		ObsidianNotesDir:             "Inbox/WeChat",
+		ObsidianAssetsDir:            "Assets/WeChat",
+		ObsidianOpenAfterArchive:     false,
+		ObsidianAutoArchiveEnabled:   true,
+		ObsidianAutoArchiveMode:      "hybrid",
+		ObsidianArchiveWindowMinutes: 30,
+		ObsidianArchiveReplyEnabled:  true,
+		ObsidianVoiceArchiveMode:     "audio+transcript",
+		ObsidianVideoArchiveMode:     "asset+summary",
+		AgentInputPolicy:             "canonical",
 	}
 }
 
@@ -106,8 +139,42 @@ func Load() (*Config, error) {
 		cfg.Agents = make(map[string]AgentConfig)
 	}
 
+	applyDefaults(cfg)
 	loadEnv(cfg)
 	return cfg, nil
+}
+
+func applyDefaults(cfg *Config) {
+	if cfg.VoiceInputModeDefault == "" {
+		cfg.VoiceInputModeDefault = "transcript_first"
+	}
+	if cfg.ObsidianVaultDir == "" {
+		cfg.ObsidianVaultDir = "~/Documents/LongclawVault"
+	}
+	if cfg.AgentInputPolicy == "" {
+		cfg.AgentInputPolicy = "canonical"
+	}
+	if cfg.ObsidianVaultName == "" {
+		cfg.ObsidianVaultName = "LongclawVault"
+	}
+	if cfg.ObsidianNotesDir == "" {
+		cfg.ObsidianNotesDir = "Inbox/WeChat"
+	}
+	if cfg.ObsidianAssetsDir == "" {
+		cfg.ObsidianAssetsDir = "Assets/WeChat"
+	}
+	if cfg.ObsidianAutoArchiveMode == "" {
+		cfg.ObsidianAutoArchiveMode = "hybrid"
+	}
+	if cfg.ObsidianArchiveWindowMinutes <= 0 {
+		cfg.ObsidianArchiveWindowMinutes = 30
+	}
+	if cfg.ObsidianVoiceArchiveMode == "" {
+		cfg.ObsidianVoiceArchiveMode = "audio+transcript"
+	}
+	if cfg.ObsidianVideoArchiveMode == "" {
+		cfg.ObsidianVideoArchiveMode = "asset+summary"
+	}
 }
 
 func loadEnv(cfg *Config) {
@@ -122,6 +189,56 @@ func loadEnv(cfg *Config) {
 	}
 	if v := os.Getenv("WECLAW_PERSONA_DIR"); v != "" {
 		cfg.PersonaDir = v
+	}
+	if v := os.Getenv("WECLAW_VOICE_INPUT_MODE_DEFAULT"); v != "" {
+		cfg.VoiceInputModeDefault = v
+	}
+	if v := os.Getenv("WECLAW_ARCHIVE_TOOL_ENABLED"); v != "" {
+		cfg.ArchiveToolEnabled = v == "1" || v == "true" || v == "TRUE"
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_VAULT_DIR"); v != "" {
+		cfg.ObsidianVaultDir = v
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_VAULT_NAME"); v != "" {
+		cfg.ObsidianVaultName = v
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_NOTES_DIR"); v != "" {
+		cfg.ObsidianNotesDir = v
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_ASSETS_DIR"); v != "" {
+		cfg.ObsidianAssetsDir = v
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_ENABLED"); v != "" {
+		cfg.ObsidianEnabled = v == "1" || v == "true" || v == "TRUE"
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_FORMAL_WRITE_ENABLED"); v != "" {
+		cfg.ObsidianFormalWriteEnabled = v == "1" || v == "true" || v == "TRUE"
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_OPEN_AFTER_ARCHIVE"); v != "" {
+		cfg.ObsidianOpenAfterArchive = v == "1" || v == "true" || v == "TRUE"
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_AUTO_ARCHIVE_ENABLED"); v != "" {
+		cfg.ObsidianAutoArchiveEnabled = v == "1" || v == "true" || v == "TRUE"
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_AUTO_ARCHIVE_MODE"); v != "" {
+		cfg.ObsidianAutoArchiveMode = v
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_ARCHIVE_WINDOW_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.ObsidianArchiveWindowMinutes = n
+		}
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_ARCHIVE_REPLY_ENABLED"); v != "" {
+		cfg.ObsidianArchiveReplyEnabled = v == "1" || v == "true" || v == "TRUE"
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_VOICE_ARCHIVE_MODE"); v != "" {
+		cfg.ObsidianVoiceArchiveMode = v
+	}
+	if v := os.Getenv("WECLAW_OBSIDIAN_VIDEO_ARCHIVE_MODE"); v != "" {
+		cfg.ObsidianVideoArchiveMode = v
+	}
+	if v := os.Getenv("WECLAW_AGENT_INPUT_POLICY"); v != "" {
+		cfg.AgentInputPolicy = v
 	}
 }
 

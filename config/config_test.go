@@ -91,11 +91,27 @@ func TestDefaultConfigInitializesAgentsMap(t *testing.T) {
 	if cfg.Agents == nil {
 		t.Fatal("DefaultConfig() Agents = nil, want initialized map")
 	}
+	if cfg.VoiceInputModeDefault != "transcript_first" {
+		t.Fatalf("VoiceInputModeDefault = %q", cfg.VoiceInputModeDefault)
+	}
+	if !cfg.ArchiveToolEnabled {
+		t.Fatal("ArchiveToolEnabled = false, want true")
+	}
+	if !cfg.ObsidianFormalWriteEnabled {
+		t.Fatal("ObsidianFormalWriteEnabled = false, want true")
+	}
+	if cfg.AgentInputPolicy != "canonical" {
+		t.Fatalf("AgentInputPolicy = %q", cfg.AgentInputPolicy)
+	}
 }
 
 func TestLoadEnvOverridesTopLevelOnly(t *testing.T) {
 	t.Setenv("WECLAW_DEFAULT_AGENT", "codex")
 	t.Setenv("WECLAW_API_ADDR", "127.0.0.1:18011")
+	t.Setenv("WECLAW_VOICE_INPUT_MODE_DEFAULT", "audio_analysis_requested")
+	t.Setenv("WECLAW_ARCHIVE_TOOL_ENABLED", "false")
+	t.Setenv("WECLAW_OBSIDIAN_FORMAL_WRITE_ENABLED", "false")
+	t.Setenv("WECLAW_AGENT_INPUT_POLICY", "canonical")
 
 	cfg := DefaultConfig()
 	cfg.Agents["claude"] = AgentConfig{
@@ -112,6 +128,18 @@ func TestLoadEnvOverridesTopLevelOnly(t *testing.T) {
 	}
 	if cfg.APIAddr != "127.0.0.1:18011" {
 		t.Fatalf("APIAddr = %q, want %q", cfg.APIAddr, "127.0.0.1:18011")
+	}
+	if cfg.VoiceInputModeDefault != "audio_analysis_requested" {
+		t.Fatalf("VoiceInputModeDefault = %q", cfg.VoiceInputModeDefault)
+	}
+	if cfg.ArchiveToolEnabled {
+		t.Fatal("ArchiveToolEnabled = true, want false")
+	}
+	if cfg.ObsidianFormalWriteEnabled {
+		t.Fatal("ObsidianFormalWriteEnabled = true, want false")
+	}
+	if cfg.AgentInputPolicy != "canonical" {
+		t.Fatalf("AgentInputPolicy = %q", cfg.AgentInputPolicy)
 	}
 	if got := cfg.Agents["claude"].Env["KEEP"]; got != "value" {
 		t.Fatalf("agent env = %q, want preserved value", got)

@@ -54,6 +54,16 @@ docker run -it -v ~/.weclaw:/root/.weclaw ghcr.io/fastclaw-ai/weclaw start
 
 Auto-detection picks ACP over CLI when both are available.
 
+## Architecture Boundary
+
+WeClaw is the WeChat bridge core, not the full desktop product shell.
+
+- Keep in `weclaw`: WeChat message semantics, media parsing, transcript-first voice normalization, session/media facts, canonical agent input, and archive tool contracts.
+- Keep out of `weclaw`: launchd/process supervision, TLS preflight, desktop UI, installer flows, and environment-specific runtime policies.
+- Downstream products should integrate through stable interfaces such as `~/.weclaw/config.json`, the `weclaw` CLI, and workspace/session/sidecar files.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the detailed boundary.
+
 ## Chat Commands
 
 Send these as WeChat messages:
@@ -188,6 +198,10 @@ Environment variables:
 - `WECLAW_DEFAULT_AGENT` — override default agent
 - `OPENCLAW_GATEWAY_URL` — OpenClaw HTTP fallback endpoint
 - `OPENCLAW_GATEWAY_TOKEN` — OpenClaw API token
+- `WECLAW_VOICE_INPUT_MODE_DEFAULT` — default voice normalization mode
+- `WECLAW_ARCHIVE_TOOL_ENABLED` — enable or disable archive tool handling
+- `WECLAW_OBSIDIAN_FORMAL_WRITE_ENABLED` — allow formal Obsidian writes
+- `WECLAW_AGENT_INPUT_POLICY` — select the canonical agent input policy
 
 Custom agent CLI environment variables:
 
