@@ -63,6 +63,7 @@ WeClaw is the WeChat bridge core, not the full desktop product shell.
 - Downstream products should integrate through stable interfaces such as `~/.weclaw/config.json`, the `weclaw` CLI, and workspace/session/sidecar files.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the detailed boundary.
+Fork maintenance guidance lives in [docs/FORK_MAINTENANCE.md](docs/FORK_MAINTENANCE.md).
 
 ## Chat Commands
 
