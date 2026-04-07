@@ -271,8 +271,11 @@ func TestHandleMessage_ImageWithoutMatchingTypeSavesAndDispatches(t *testing.T) 
 	if got := len(*sent); got != 2 {
 		t.Fatalf("expected 2 outgoing text messages, got %d (%v)", got, *sent)
 	}
-	if !strings.Contains((*sent)[0], "Saved:") {
+	if !strings.Contains((*sent)[0], "已收到图片") {
 		t.Fatalf("expected save ack, got %q", (*sent)[0])
+	}
+	if !strings.Contains((*sent)[0], filepath.Base(saved)) {
+		t.Fatalf("expected saved image filename in ack, got %q", (*sent)[0])
 	}
 	if !strings.Contains((*sent)[1], "processed image") {
 		t.Fatalf("expected agent reply, got %q", (*sent)[1])
@@ -352,7 +355,7 @@ func TestHandleMessage_FileSavesAndDispatches(t *testing.T) {
 	if got := len(*sent); got != 2 {
 		t.Fatalf("expected 2 outgoing text messages, got %d (%v)", got, *sent)
 	}
-	if !strings.Contains((*sent)[0], "Saved: report.pdf") {
+	if !strings.Contains((*sent)[0], "已收到文件") || !strings.Contains((*sent)[0], "report.pdf") {
 		t.Fatalf("expected file save ack, got %q", (*sent)[0])
 	}
 	if !strings.Contains((*sent)[1], "processed file") {
@@ -414,5 +417,52 @@ func TestHandleMessage_FileDownloadFailureDoesNotDispatch(t *testing.T) {
 	}
 	if !strings.Contains((*sent)[0], "Failed to save file") {
 		t.Fatalf("expected failure ack, got %q", (*sent)[0])
+	}
+}
+
+func TestFormatBrandedReply_UsesBrandHeader(t *testing.T) {
+	got := formatBrandedReply("codex", "修复已经完成", replyKindAgent)
+	if !strings.HasPrefix(got, "OpenAI｜小德总汇报： ") {
+		t.Fatalf("unexpected codex header: %q", got)
+	}
+	if !strings.Contains(got, "修复已经完成") {
+		t.Fatalf("expected detail to remain, got %q", got)
+	}
+
+	got = formatBrandedReply("claude", "请直接执行下一步。", replyKindStatus)
+	if !strings.HasPrefix(got, "Claude｜小克总状态播报： ") {
+		t.Fatalf("unexpected claude header: %q", got)
+	}
+}
+
+func TestSendReplyWithMedia_SendsSingleBrandedText(t *testing.T) {
+	srv, sent := newTestILinkServer(t)
+	defer srv.Close()
+
+	h := newTestHandler()
+	client := ilink.NewClient(&ilink.Credentials{
+		BaseURL:    srv.URL,
+		BotToken:   "token",
+		ILinkBotID: "bot@im.bot",
+	})
+
+	msg := ilink.WeixinMessage{
+		MessageID:    99,
+		FromUserID:   "user@im.wechat",
+		MessageType:  ilink.MessageTypeUser,
+		MessageState: ilink.MessageStateFinish,
+		ContextToken: "ctx",
+	}
+
+	h.sendReplyWithMedia(context.Background(), client, msg, "codex", "Fixed the issue and outlined the next step.", "client-1")
+
+	if got := len(*sent); got != 1 {
+		t.Fatalf("expected 1 outgoing text message, got %d (%v)", got, *sent)
+	}
+	if !strings.Contains((*sent)[0], "OpenAI｜小德总汇报") {
+		t.Fatalf("expected branded prefix, got %q", (*sent)[0])
+	}
+	if !strings.Contains((*sent)[0], "Fixed the issue") {
+		t.Fatalf("expected detail text, got %q", (*sent)[0])
 	}
 }

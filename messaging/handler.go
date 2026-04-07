@@ -41,6 +41,7 @@ type Handler struct {
 	saveDefault   SaveDefaultFunc
 	contextTokens sync.Map // map[userID]contextToken
 	saveDir       string   // directory to save images/files to
+	personaDir    string   // directory with persona assets + manifest
 	seenMsgs      sync.Map // map[int64]time.Time — dedup by message_id
 }
 
@@ -57,6 +58,11 @@ func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 // SetSaveDir sets the directory for saving images and files.
 func (h *Handler) SetSaveDir(dir string) {
 	h.saveDir = dir
+}
+
+// SetPersonaDir sets the directory for persona assets and manifest.
+func (h *Handler) SetPersonaDir(dir string) {
+	h.personaDir = dir
 }
 
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
@@ -146,6 +152,12 @@ func (h *Handler) getDefaultAgent() agent.Agent {
 		return nil
 	}
 	return h.agents[h.defaultName]
+}
+
+func (h *Handler) getDefaultAgentName() string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.defaultName
 }
 
 // isKnownAgent checks if a name corresponds to a configured agent.
@@ -322,9 +334,7 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 			} else {
 				reply = fmt.Sprintf("已保存: %s", title)
 			}
-			if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-				log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
-			}
+			h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindLinkhoard)
 			return
 		}
 	}
@@ -332,27 +342,19 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	// Built-in commands (no typing needed)
 	if trimmed == "/info" {
 		reply := h.buildStatus()
-		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
-		}
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindStatus)
 		return
 	} else if trimmed == "/help" {
 		reply := buildHelpText()
-		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
-		}
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindHelp)
 		return
 	} else if trimmed == "/new" || trimmed == "/clear" {
 		reply := h.resetDefaultSession(ctx, msg.FromUserID)
-		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
-		}
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindStatus)
 		return
 	} else if strings.HasPrefix(trimmed, "/cwd") {
 		reply := h.handleCwd(trimmed)
-		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
-		}
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindStatus)
 		return
 	}
 
@@ -369,17 +371,13 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	if message == "" {
 		if len(agentNames) == 1 && h.isKnownAgent(agentNames[0]) {
 			reply := h.switchDefault(ctx, agentNames[0])
-			if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-				log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
-			}
+			h.sendStructuredTextReply(ctx, client, msg, agentNames[0], reply, clientID, replyKindSwitch)
 		} else if len(agentNames) == 1 && !h.isKnownAgent(agentNames[0]) {
 			// Unknown agent -> forward to default
 			h.sendToDefaultAgent(ctx, client, msg, text, clientID)
 		} else {
 			reply := "Usage: specify one agent to switch, or add a message to broadcast"
-			if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-				log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
-			}
+			h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindUsage)
 		}
 		return
 	}
@@ -447,7 +445,7 @@ func (h *Handler) sendToNamedAgent(ctx context.Context, client *ilink.Client, ms
 	if agErr != nil {
 		log.Printf("[handler] agent %q not available: %v", name, agErr)
 		reply := fmt.Sprintf("Agent %q is not available: %v", name, agErr)
-		SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		h.sendStructuredTextReply(ctx, client, msg, name, reply, clientID, replyKindError)
 		return
 	}
 
@@ -499,32 +497,54 @@ func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, 
 	attachmentPaths := extractLocalAttachmentPaths(reply)
 	allowedRoots := h.allowedAttachmentRoots(agentName)
 
-	var sentPaths []string
+	detail := rewriteReplyForDeferredAttachments(reply, attachmentPaths)
+
 	var failedPaths []string
 	for _, attachmentPath := range attachmentPaths {
 		if !isAllowedAttachmentPath(attachmentPath, allowedRoots) {
 			log.Printf("[handler] rejected attachment outside allowed roots for agent %q: %s", agentName, attachmentPath)
 			failedPaths = append(failedPaths, attachmentPath)
+		}
+	}
+
+	h.sendStructuredTextReply(ctx, client, msg, agentName, detail, clientID, replyKindAgent)
+
+	for _, attachmentPath := range attachmentPaths {
+		if !isAllowedAttachmentPath(attachmentPath, allowedRoots) {
 			continue
 		}
 		if err := SendMediaFromPath(ctx, client, msg.FromUserID, attachmentPath, msg.ContextToken); err != nil {
 			log.Printf("[handler] failed to send attachment to %s: %v", msg.FromUserID, err)
 			failedPaths = append(failedPaths, attachmentPath)
-			continue
 		}
-		sentPaths = append(sentPaths, attachmentPath)
 	}
 
-	reply = rewriteReplyWithAttachmentResults(reply, sentPaths, failedPaths)
-
-	if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+	if len(failedPaths) > 0 {
+		failureReply := rewriteReplyWithAttachmentResults("", nil, failedPaths)
+		h.sendStructuredTextReply(ctx, client, msg, agentName, failureReply, NewClientID(), replyKindError)
 	}
 
 	for _, imgURL := range imageURLs {
 		if err := SendMediaFromURL(ctx, client, msg.FromUserID, imgURL, msg.ContextToken); err != nil {
 			log.Printf("[handler] failed to send image to %s: %v", msg.FromUserID, err)
 		}
+	}
+
+	log.Printf("[handler] delivered reply to %s (agent=%s, text_chars=%d, image_urls=%d, attachments=%d, failed_attachments=%d)", msg.FromUserID, agentName, len([]rune(strings.TrimSpace(detail))), len(imageURLs), len(attachmentPaths), len(failedPaths))
+}
+
+func (h *Handler) sendStructuredTextReply(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, agentName, detail, clientID string, kind replyKind) {
+	if strings.TrimSpace(detail) == "" {
+		return
+	}
+
+	if agentName == "" {
+		agentName = h.getDefaultAgentName()
+	}
+
+	reply := formatBrandedReply(agentName, detail, kind)
+	if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
 	}
 }
 
@@ -556,6 +576,9 @@ func (h *Handler) chatWithAgent(ctx context.Context, ag agent.Agent, userID, mes
 		return "", err
 	}
 
+	imageURLs := ExtractImageURLs(reply)
+	attachmentPaths := extractLocalAttachmentPaths(reply)
+	log.Printf("[handler] agent completed (%s, elapsed=%s, chars=%d, image_urls=%d, attachments=%d)", info, elapsed, len([]rune(strings.TrimSpace(reply))), len(imageURLs), len(attachmentPaths))
 	log.Printf("[handler] agent replied (%s, elapsed=%s): %q", info, elapsed, truncate(reply, 100))
 	return reply, nil
 }
@@ -759,7 +782,7 @@ func (h *Handler) handleImageSave(ctx context.Context, client *ilink.Client, msg
 	if err != nil {
 		log.Printf("[handler] failed to download image from %s: %v", msg.FromUserID, err)
 		reply := fmt.Sprintf("Failed to save image: %v", err)
-		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindError)
 		return
 	}
 
@@ -773,15 +796,13 @@ func (h *Handler) handleImageSave(ctx context.Context, client *ilink.Client, msg
 	if err != nil {
 		log.Printf("[handler] failed to persist image: %v", err)
 		reply := fmt.Sprintf("Failed to save image: %v", err)
-		_ = SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID)
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindError)
 		return
 	}
 
 	log.Printf("[handler] saved image to %s (%d bytes)", filePath, len(data))
-	reply := fmt.Sprintf("Saved: %s", fileName)
-	if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
-		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
-	}
+	reply := buildSavedMediaReply("图片", fileName)
+	h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindSave)
 	h.dispatchSavedMediaToDefaultAgent(ctx, client, msg, "图片", filePath)
 }
 
@@ -791,14 +812,14 @@ func (h *Handler) handleFileSave(ctx context.Context, client *ilink.Client, msg 
 
 	if file.Media == nil || file.Media.EncryptQueryParam == "" {
 		log.Printf("[handler] file has no media info from %s", msg.FromUserID)
-		_ = SendTextReply(ctx, client, msg.FromUserID, "Failed to save file: missing media info", msg.ContextToken, clientID)
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), "Failed to save file: missing media info", clientID, replyKindError)
 		return
 	}
 
 	data, err := DownloadFileFromCDN(ctx, file.Media.EncryptQueryParam, file.Media.AESKey)
 	if err != nil {
 		log.Printf("[handler] failed to download file from %s: %v", msg.FromUserID, err)
-		_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("Failed to save file: %v", err), msg.ContextToken, clientID)
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), fmt.Sprintf("Failed to save file: %v", err), clientID, replyKindError)
 		return
 	}
 
@@ -806,14 +827,12 @@ func (h *Handler) handleFileSave(ctx context.Context, client *ilink.Client, msg 
 	filePath, err := saveIncomingMediaFile(h.saveDir, fileName, data)
 	if err != nil {
 		log.Printf("[handler] failed to persist file: %v", err)
-		_ = SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("Failed to save file: %v", err), msg.ContextToken, clientID)
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), fmt.Sprintf("Failed to save file: %v", err), clientID, replyKindError)
 		return
 	}
 
 	log.Printf("[handler] saved file to %s (%d bytes)", filePath, len(data))
-	if err := SendTextReply(ctx, client, msg.FromUserID, fmt.Sprintf("Saved: %s", filepath.Base(filePath)), msg.ContextToken, clientID); err != nil {
-		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
-	}
+	h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), buildSavedMediaReply("文件", filepath.Base(filePath)), clientID, replyKindSave)
 	h.dispatchSavedMediaToDefaultAgent(ctx, client, msg, "文件", filePath)
 }
 
@@ -839,6 +858,10 @@ func saveIncomingMediaFile(dir, fileName string, data []byte) (string, error) {
 	}
 
 	return filePath, nil
+}
+
+func buildSavedMediaReply(mediaType, fileName string) string {
+	return fmt.Sprintf("已收到%s，已保存为 %s。正在继续处理。", mediaType, fileName)
 }
 
 func sanitizeIncomingFileName(name string) string {

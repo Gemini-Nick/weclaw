@@ -137,6 +137,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 		handler.SetSaveDir(cfg.SaveDir)
 		log.Printf("Image save directory: %s", cfg.SaveDir)
 	}
+	if cfg.PersonaDir != "" {
+		handler.SetPersonaDir(cfg.PersonaDir)
+		log.Printf("Persona asset directory: %s", cfg.PersonaDir)
+	}
 
 	// Start default agent initialization in background so monitors can start immediately
 	go func() {

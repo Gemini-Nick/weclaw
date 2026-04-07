@@ -108,6 +108,27 @@ func rewriteReplyWithAttachmentResults(reply string, sentPaths, failedPaths []st
 	return rewritten + "\n" + strings.Join(failureLines, "\n")
 }
 
+func rewriteReplyForDeferredAttachments(reply string, attachmentPaths []string) string {
+	if len(attachmentPaths) == 0 {
+		return reply
+	}
+
+	replacements := make(map[string]string, len(attachmentPaths))
+	for _, path := range attachmentPaths {
+		replacements[path] = "附件稍后发送：" + filepath.Base(path)
+	}
+
+	lines := strings.Split(reply, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if replacement, ok := replacements[trimmed]; ok {
+			lines[i] = replacement
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
 func isSupportedAttachmentPath(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	return slices.Contains(supportedAttachmentExts, ext)
