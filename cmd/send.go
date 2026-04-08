@@ -48,16 +48,23 @@ var sendCmd = &cobra.Command{
 		}
 
 		client := ilink.NewClient(accounts[0])
+		contextToken, hasContextToken := messaging.LookupContextToken(sendTo)
 
 		if sendText != "" {
-			if err := messaging.SendTextReply(ctx, client, sendTo, sendText, "", ""); err != nil {
+			if err := messaging.SendTextReply(ctx, client, sendTo, sendText, contextToken, ""); err != nil {
+				if !hasContextToken {
+					return fmt.Errorf("send text failed: %w (no persisted context token for %s; send the bot a fresh WeChat message first)", err, sendTo)
+				}
 				return fmt.Errorf("send text failed: %w", err)
 			}
 			fmt.Println("Text sent")
 		}
 
 		if sendMediaURL != "" {
-			if err := messaging.SendMediaFromURL(ctx, client, sendTo, sendMediaURL, ""); err != nil {
+			if err := messaging.SendMediaFromURL(ctx, client, sendTo, sendMediaURL, contextToken); err != nil {
+				if !hasContextToken {
+					return fmt.Errorf("send media failed: %w (no persisted context token for %s; send the bot a fresh WeChat message first)", err, sendTo)
+				}
 				return fmt.Errorf("send media failed: %w", err)
 			}
 			fmt.Println("Media sent")

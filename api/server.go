@@ -84,11 +84,16 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	// Use the first client
 	client := s.clients[0]
 	ctx := r.Context()
+	contextToken, hasContextToken := messaging.LookupContextToken(req.To)
 
 	// Send text if provided
 	if req.Text != "" {
-		if err := messaging.SendTextReply(ctx, client, req.To, req.Text, "", ""); err != nil {
+		if err := messaging.SendTextReply(ctx, client, req.To, req.Text, contextToken, ""); err != nil {
 			log.Printf("[api] send text failed: %v", err)
+			if !hasContextToken {
+				http.Error(w, "send text failed: "+err.Error()+" (no persisted context token; send the bot a fresh message first)", http.StatusInternalServerError)
+				return
+			}
 			http.Error(w, "send text failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -106,8 +111,12 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 
 	// Send media if provided
 	if req.MediaURL != "" {
-		if err := messaging.SendMediaFromURL(ctx, client, req.To, req.MediaURL, ""); err != nil {
+		if err := messaging.SendMediaFromURL(ctx, client, req.To, req.MediaURL, contextToken); err != nil {
 			log.Printf("[api] send media failed: %v", err)
+			if !hasContextToken {
+				http.Error(w, "send media failed: "+err.Error()+" (no persisted context token; send the bot a fresh message first)", http.StatusInternalServerError)
+				return
+			}
 			http.Error(w, "send media failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}

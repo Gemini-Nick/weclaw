@@ -99,7 +99,7 @@ func DefaultConfig() *Config {
 		ObsidianAutoArchiveMode:      "hybrid",
 		ObsidianArchiveWindowMinutes: 30,
 		ObsidianArchiveReplyEnabled:  true,
-		ObsidianVoiceArchiveMode:     "audio+transcript",
+		ObsidianVoiceArchiveMode:     "transcript_only",
 		ObsidianVideoArchiveMode:     "asset+summary",
 		AgentInputPolicy:             "canonical",
 	}
@@ -170,7 +170,7 @@ func applyDefaults(cfg *Config) {
 		cfg.ObsidianArchiveWindowMinutes = 30
 	}
 	if cfg.ObsidianVoiceArchiveMode == "" {
-		cfg.ObsidianVoiceArchiveMode = "audio+transcript"
+		cfg.ObsidianVoiceArchiveMode = "transcript_only"
 	}
 	if cfg.ObsidianVideoArchiveMode == "" {
 		cfg.ObsidianVideoArchiveMode = "asset+summary"

@@ -57,6 +57,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	releaseSingleton, err := acquireProcessSingleton()
+	if err != nil {
+		return err
+	}
+	defer releaseSingleton()
+	if err := writePidFile(os.Getpid()); err != nil {
+		log.Printf("Warning: failed to write pid file: %v", err)
+	} else {
+		defer os.Remove(pidFile())
+	}
+
 	// Load all accounts
 	accounts, err := ilink.LoadAllCredentials()
 	if err != nil {
@@ -128,6 +139,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 	handler.SetAgentMetas(metas)
 	handler.SetAgentWorkDirs(workDirs)
+	handler.SetConfig(cfg)
 
 	// Load custom aliases from agent configs
 	handler.SetCustomAliases(config.BuildAliasMap(cfg.Agents))
@@ -347,6 +359,10 @@ func pidFile() string {
 	return filepath.Join(weclawDir(), "weclaw.pid")
 }
 
+func lockFile() string {
+	return filepath.Join(weclawDir(), "weclaw.lock")
+}
+
 func logFile() string {
 	return filepath.Join(weclawDir(), "weclaw.log")
 }
@@ -407,6 +423,17 @@ func readPid() (int, error) {
 		return 0, err
 	}
 	return pid, nil
+}
+
+func writePidFile(pid int) error {
+	if err := os.MkdirAll(weclawDir(), 0o700); err != nil {
+		return err
+	}
+	tmp := pidFile() + ".tmp"
+	if err := os.WriteFile(tmp, []byte(fmt.Sprintf("%d", pid)), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, pidFile())
 }
 
 func processExists(pid int) bool {

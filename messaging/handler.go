@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/fastclaw-ai/weclaw/agent"
+	"github.com/fastclaw-ai/weclaw/config"
 	"github.com/fastclaw-ai/weclaw/ilink"
+	obsidianarchive "github.com/fastclaw-ai/weclaw/obsidian"
 	"github.com/google/uuid"
 )
 
@@ -42,8 +44,15 @@ type Handler struct {
 	contextTokens sync.Map // map[userID]contextToken
 	saveDir       string   // directory to save images/files to
 	personaDir    string   // directory with persona assets + manifest
-	seenMsgs      sync.Map // map[int64]time.Time — dedup by message_id
+	cfg           *config.Config
+	seenMsgs      sync.Map // map[string]time.Time — dedup by user_id + message_id
 }
+
+const (
+	voiceModeTranscriptFirst      = "transcript_first"
+	voiceModeTranscriptPlusAudio  = "transcript_plus_audio_context"
+	voiceModeAudioAnalysisRequest = "audio_analysis_requested"
+)
 
 // NewHandler creates a new message handler.
 func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
@@ -65,6 +74,10 @@ func (h *Handler) SetPersonaDir(dir string) {
 	h.personaDir = dir
 }
 
+func (h *Handler) SetConfig(cfg *config.Config) {
+	h.cfg = cfg
+}
+
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
 func (h *Handler) cleanSeenMsgs() {
 	cutoff := time.Now().Add(-5 * time.Minute)
@@ -74,6 +87,33 @@ func (h *Handler) cleanSeenMsgs() {
 		}
 		return true
 	})
+}
+
+func (h *Handler) claimIncomingMessage(userID string, messageID int64) bool {
+	if messageID == 0 {
+		return true
+	}
+
+	now := time.Now()
+	key := fmt.Sprintf("%s:%d", userID, messageID)
+	if _, loaded := h.seenMsgs.LoadOrStore(key, now); loaded {
+		return false
+	}
+
+	claimed, err := claimDurableSeenMessage(userID, messageID, now)
+	if err != nil {
+		log.Printf("[handler] durable message dedup unavailable for %s/%d: %v", userID, messageID, err)
+		go h.cleanSeenMsgs()
+		return true
+	}
+	if !claimed {
+		h.seenMsgs.Delete(key)
+		return false
+	}
+
+	go h.cleanSeenMsgs()
+	go cleanupDurableSeenMessages(now)
+	return true
 }
 
 // SetCustomAliases sets custom alias mappings from config.
@@ -281,15 +321,30 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 
 	// Deduplicate by message_id to avoid processing the same message multiple times
 	// (voice messages may trigger multiple finish-state updates)
-	if msg.MessageID != 0 {
-		if _, loaded := h.seenMsgs.LoadOrStore(msg.MessageID, time.Now()); loaded {
-			return
-		}
-		// Clean up old entries periodically (fire-and-forget)
-		go h.cleanSeenMsgs()
+	if !h.claimIncomingMessage(msg.FromUserID, msg.MessageID) {
+		return
 	}
 
 	log.Printf("[handler] incoming message id=%d from=%s items=%s", msg.MessageID, msg.FromUserID, describeMessageItems(msg))
+	h.contextTokens.Store(msg.FromUserID, msg.ContextToken)
+	if err := RememberContextToken(msg.FromUserID, msg.ContextToken); err != nil {
+		log.Printf("[handler] failed to persist context token for %s: %v", msg.FromUserID, err)
+	}
+
+	var savedVoicePath string
+	var savedVoiceTranscript string
+	if voice := extractVoice(msg); voice != nil && h.saveDir != "" {
+		path, transcript, ok := h.handleVoiceSave(ctx, client, msg, voice)
+		if ok {
+			savedVoicePath = path
+			savedVoiceTranscript = transcript
+		}
+	}
+	if video := extractVideo(msg); video != nil && h.saveDir != "" {
+		if h.handleVideoSave(ctx, client, msg, video) {
+			return
+		}
+	}
 
 	// Extract text from item list (text message or voice transcription)
 	text := extractText(msg)
@@ -298,6 +353,11 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 			text = voiceText
 			log.Printf("[handler] voice transcription from %s: %q", msg.FromUserID, truncate(text, 80))
 		}
+	}
+	voiceMode := resolveVoiceInputMode(h.cfg, savedVoiceTranscript, savedVoicePath != "")
+	if text != "" && savedVoicePath != "" {
+		text = buildVoiceAgentInput(strings.TrimSpace(text), savedVoicePath, voiceMode)
+		log.Printf("[handler] voice_mode=%s agent_audio_exposed=%t from=%s", voiceMode, voiceModeExposesAudio(voiceMode), msg.FromUserID)
 	}
 	if text == "" {
 		if img := extractImage(msg); img != nil && h.saveDir != "" {
@@ -308,20 +368,26 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 			h.handleFileSave(ctx, client, msg, file)
 			return
 		}
+		if savedVoicePath != "" {
+			prompt := buildVoiceAgentInput(savedVoiceTranscript, savedVoicePath, voiceMode)
+			log.Printf("[handler] voice_mode=%s agent_audio_exposed=%t from=%s", voiceMode, voiceModeExposesAudio(voiceMode), msg.FromUserID)
+			h.dispatchSavedMediaPrompt(ctx, client, msg, "语音", prompt)
+			return
+		}
 		log.Printf("[handler] received non-text message from %s, skipping", msg.FromUserID)
 		return
 	}
 
 	log.Printf("[handler] received from %s: %q", msg.FromUserID, truncate(text, 80))
 
-	// Store context token for this user
-	h.contextTokens.Store(msg.FromUserID, msg.ContextToken)
-
 	// Generate a clientID for this reply (used to correlate typing → finish)
 	clientID := NewClientID()
 
 	// Intercept URLs: save to Linkhoard directly without AI agent
 	trimmed := strings.TrimSpace(text)
+	if h.cfg != nil && h.saveDir != "" {
+		_ = obsidianarchive.RecordUserMessage(h.saveDir, msg.FromUserID, msg.MessageID, trimmed)
+	}
 	if h.saveDir != "" && IsURL(trimmed) {
 		rawURL := ExtractURL(trimmed)
 		if rawURL != "" {
@@ -427,7 +493,7 @@ func (h *Handler) sendToDefaultAgent(ctx context.Context, client *ilink.Client, 
 	var reply string
 	if ag != nil {
 		var err error
-		reply, err = h.chatWithAgent(ctx, ag, msg.FromUserID, text)
+		reply, err = h.chatWithAgentWithTools(ctx, ag, msg, defaultName, text)
 		if err != nil {
 			reply = fmt.Sprintf("Error: %v", err)
 		}
@@ -449,7 +515,7 @@ func (h *Handler) sendToNamedAgent(ctx context.Context, client *ilink.Client, ms
 		return
 	}
 
-	reply, err := h.chatWithAgent(ctx, ag, msg.FromUserID, message)
+	reply, err := h.chatWithAgentWithTools(ctx, ag, msg, name, message)
 	if err != nil {
 		reply = fmt.Sprintf("Error: %v", err)
 	}
@@ -473,7 +539,7 @@ func (h *Handler) broadcastToAgents(ctx context.Context, client *ilink.Client, m
 				ch <- result{name: n, reply: fmt.Sprintf("Error: %v", err)}
 				return
 			}
-			reply, err := h.chatWithAgent(ctx, ag, msg.FromUserID, message)
+			reply, err := h.chatWithAgentWithTools(ctx, ag, msg, n, message)
 			if err != nil {
 				ch <- result{name: n, reply: fmt.Sprintf("Error: %v", err)}
 				return
@@ -530,6 +596,10 @@ func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, 
 		}
 	}
 
+	if h.saveDir != "" {
+		_ = obsidianarchive.RecordAgentReply(h.saveDir, msg.FromUserID, msg.MessageID, agentName, detail)
+	}
+
 	log.Printf("[handler] delivered reply to %s (agent=%s, text_chars=%d, image_urls=%d, attachments=%d, failed_attachments=%d)", msg.FromUserID, agentName, len([]rune(strings.TrimSpace(detail))), len(imageURLs), len(attachmentPaths), len(failedPaths))
 }
 
@@ -581,6 +651,34 @@ func (h *Handler) chatWithAgent(ctx context.Context, ag agent.Agent, userID, mes
 	log.Printf("[handler] agent completed (%s, elapsed=%s, chars=%d, image_urls=%d, attachments=%d)", info, elapsed, len([]rune(strings.TrimSpace(reply))), len(imageURLs), len(attachmentPaths))
 	log.Printf("[handler] agent replied (%s, elapsed=%s): %q", info, elapsed, truncate(reply, 100))
 	return reply, nil
+}
+
+func (h *Handler) chatWithAgentWithTools(ctx context.Context, ag agent.Agent, msg ilink.WeixinMessage, agentName, message string) (string, error) {
+	agentMessage := message
+	if h.cfg != nil && h.saveDir != "" {
+		agentMessage = obsidianarchive.BuildAgentArchivePrompt(h.cfg, h.saveDir, msg.FromUserID, message)
+	}
+
+	reply, err := h.chatWithAgent(ctx, ag, msg.FromUserID, agentMessage)
+	if err != nil {
+		return "", err
+	}
+
+	if h.cfg == nil || h.saveDir == "" || !h.cfg.ObsidianEnabled {
+		return reply, nil
+	}
+
+	result, err := obsidianarchive.ApplyAgentArchiveTool(h.cfg, h.saveDir, msg.FromUserID, reply)
+	if err != nil {
+		return fmt.Sprintf("知识库归档失败：%v", err), nil
+	}
+	if result.Invoked {
+		return result.Reply, nil
+	}
+	if obsidianarchive.LikelyArchiveIntent(h.cfg, message) {
+		log.Printf("[obsidian] archive_intent_unhandled conversation_id=%s agent=%s", msg.FromUserID, agentName)
+	}
+	return result.Reply, nil
 }
 
 // switchDefault switches the default agent. Starts it on demand if needed.
@@ -751,6 +849,24 @@ func extractFile(msg ilink.WeixinMessage) *ilink.FileItem {
 	return nil
 }
 
+func extractVoice(msg ilink.WeixinMessage) *ilink.VoiceItem {
+	for _, item := range msg.ItemList {
+		if item.VoiceItem != nil {
+			return item.VoiceItem
+		}
+	}
+	return nil
+}
+
+func extractVideo(msg ilink.WeixinMessage) *ilink.VideoItem {
+	for _, item := range msg.ItemList {
+		if item.VideoItem != nil {
+			return item.VideoItem
+		}
+	}
+	return nil
+}
+
 func extractVoiceText(msg ilink.WeixinMessage) string {
 	for _, item := range msg.ItemList {
 		if item.Type == ilink.ItemTypeVoice && item.VoiceItem != nil && item.VoiceItem.Text != "" {
@@ -789,10 +905,19 @@ func (h *Handler) handleImageSave(ctx context.Context, client *ilink.Client, msg
 	// Detect extension from content
 	ext := detectImageExt(data)
 
-	// Generate filename with timestamp
-	ts := time.Now().Format("20060102-150405")
+	// Generate a high-resolution base name; final collision avoidance happens at write time.
+	ts := mediaTimestamp()
 	fileName := fmt.Sprintf("%s%s", ts, ext)
-	filePath, err := saveIncomingMediaFile(h.saveDir, fileName, data)
+	filePath, err := saveIncomingMediaFile(h.saveDir, fileName, data, obsidianarchive.Sidecar{
+		Source:           "wechat",
+		MediaType:        "image",
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
+		RetentionDays:    7,
+		ArchiveState:     obsidianarchive.ArchiveStateActive,
+		Title:            strings.TrimSuffix(fileName, filepath.Ext(fileName)),
+		OriginalFilename: fileName,
+		WechatUserID:     msg.FromUserID,
+	}, msg.MessageID)
 	if err != nil {
 		log.Printf("[handler] failed to persist image: %v", err)
 		reply := fmt.Sprintf("Failed to save image: %v", err)
@@ -801,7 +926,7 @@ func (h *Handler) handleImageSave(ctx context.Context, client *ilink.Client, msg
 	}
 
 	log.Printf("[handler] saved image to %s (%d bytes)", filePath, len(data))
-	reply := buildSavedMediaReply("图片", fileName)
+	reply := buildSavedMediaReply("图片", filepath.Base(filePath))
 	h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindSave)
 	h.dispatchSavedMediaToDefaultAgent(ctx, client, msg, "图片", filePath)
 }
@@ -824,7 +949,16 @@ func (h *Handler) handleFileSave(ctx context.Context, client *ilink.Client, msg 
 	}
 
 	fileName := sanitizeIncomingFileName(file.FileName)
-	filePath, err := saveIncomingMediaFile(h.saveDir, fileName, data)
+	filePath, err := saveIncomingMediaFile(h.saveDir, fileName, data, obsidianarchive.Sidecar{
+		Source:           "wechat",
+		MediaType:        "file",
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
+		RetentionDays:    7,
+		ArchiveState:     obsidianarchive.ArchiveStateActive,
+		Title:            strings.TrimSuffix(filepath.Base(fileName), filepath.Ext(fileName)),
+		OriginalFilename: fileName,
+		WechatUserID:     msg.FromUserID,
+	}, msg.MessageID)
 	if err != nil {
 		log.Printf("[handler] failed to persist file: %v", err)
 		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), fmt.Sprintf("Failed to save file: %v", err), clientID, replyKindError)
@@ -836,25 +970,176 @@ func (h *Handler) handleFileSave(ctx context.Context, client *ilink.Client, msg 
 	h.dispatchSavedMediaToDefaultAgent(ctx, client, msg, "文件", filePath)
 }
 
+func (h *Handler) handleVoiceSave(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, voice *ilink.VoiceItem) (string, string, bool) {
+	clientID := NewClientID()
+	log.Printf("[handler] received voice from %s, saving to %s", msg.FromUserID, h.saveDir)
+	if voice.Media == nil || voice.Media.EncryptQueryParam == "" {
+		log.Printf("[handler] voice has no media info from %s", msg.FromUserID)
+		return "", "", false
+	}
+	data, err := DownloadFileFromCDN(ctx, voice.Media.EncryptQueryParam, voice.Media.AESKey)
+	if err != nil {
+		log.Printf("[handler] failed to download voice from %s: %v", msg.FromUserID, err)
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), fmt.Sprintf("Failed to save voice: %v", err), clientID, replyKindError)
+		return "", "", false
+	}
+	fileName := mediaTimestamp() + detectVoiceExt(voice)
+	sidecar := obsidianarchive.Sidecar{
+		Source:           "wechat",
+		MediaType:        "voice",
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
+		RetentionDays:    7,
+		ArchiveState:     obsidianarchive.ArchiveStateActive,
+		Title:            strings.TrimSuffix(fileName, filepath.Ext(fileName)),
+		OriginalFilename: fileName,
+		WechatUserID:     msg.FromUserID,
+		Remark:           strings.TrimSpace(voice.Text),
+	}
+	filePath, err := saveIncomingMediaFile(h.saveDir, fileName, data, sidecar, msg.MessageID)
+	if err != nil {
+		log.Printf("[handler] failed to persist voice: %v", err)
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), fmt.Sprintf("Failed to save voice: %v", err), clientID, replyKindError)
+		return "", "", false
+	}
+	log.Printf("[handler] saved voice to %s (%d bytes)", filePath, len(data))
+	h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), buildSavedMediaReply("语音", filepath.Base(filePath)), clientID, replyKindSave)
+	return filePath, strings.TrimSpace(voice.Text), true
+}
+
+func (h *Handler) handleVideoSave(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, video *ilink.VideoItem) bool {
+	clientID := NewClientID()
+	log.Printf("[handler] received video from %s, saving to %s", msg.FromUserID, h.saveDir)
+	if video.Media == nil || video.Media.EncryptQueryParam == "" {
+		log.Printf("[handler] video has no media info from %s", msg.FromUserID)
+		return false
+	}
+	data, err := DownloadFileFromCDN(ctx, video.Media.EncryptQueryParam, video.Media.AESKey)
+	if err != nil {
+		log.Printf("[handler] failed to download video from %s: %v", msg.FromUserID, err)
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), fmt.Sprintf("Failed to save video: %v", err), clientID, replyKindError)
+		return false
+	}
+	fileName := mediaTimestamp() + ".mp4"
+	filePath, err := saveIncomingMediaFile(h.saveDir, fileName, data, obsidianarchive.Sidecar{
+		Source:           "wechat",
+		MediaType:        "video",
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
+		RetentionDays:    7,
+		ArchiveState:     obsidianarchive.ArchiveStateActive,
+		Title:            strings.TrimSuffix(fileName, filepath.Ext(fileName)),
+		OriginalFilename: fileName,
+		WechatUserID:     msg.FromUserID,
+	}, msg.MessageID)
+	if err != nil {
+		log.Printf("[handler] failed to persist video: %v", err)
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), fmt.Sprintf("Failed to save video: %v", err), clientID, replyKindError)
+		return false
+	}
+	log.Printf("[handler] saved video to %s (%d bytes)", filePath, len(data))
+	h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), buildSavedMediaReply("视频", filepath.Base(filePath)), clientID, replyKindSave)
+	h.dispatchSavedMediaToDefaultAgent(ctx, client, msg, "视频", filePath)
+	return true
+}
+
 func (h *Handler) dispatchSavedMediaToDefaultAgent(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, mediaType, path string) {
 	prompt := fmt.Sprintf("收到一个来自微信的%s，已保存到本地。请基于该文件继续处理。\n%s", mediaType, path)
+	h.dispatchSavedMediaPrompt(ctx, client, msg, mediaType, prompt)
+}
+
+func (h *Handler) dispatchSavedMediaPrompt(ctx context.Context, client *ilink.Client, msg ilink.WeixinMessage, mediaType, prompt string) {
+	_ = mediaType
 	h.sendToDefaultAgent(ctx, client, msg, prompt, NewClientID())
 }
 
-func saveIncomingMediaFile(dir, fileName string, data []byte) (string, error) {
+func resolveVoiceInputMode(cfg *config.Config, transcript string, audioAvailable bool) string {
+	mode := voiceModeTranscriptFirst
+	if cfg != nil && strings.TrimSpace(cfg.VoiceInputModeDefault) != "" {
+		mode = strings.ToLower(strings.TrimSpace(cfg.VoiceInputModeDefault))
+	}
+	switch mode {
+	case voiceModeTranscriptFirst, voiceModeTranscriptPlusAudio, voiceModeAudioAnalysisRequest:
+	default:
+		mode = voiceModeTranscriptFirst
+	}
+
+	hasTranscript := strings.TrimSpace(transcript) != ""
+	switch {
+	case mode == voiceModeTranscriptFirst && !hasTranscript && audioAvailable:
+		return voiceModeTranscriptPlusAudio
+	case mode == voiceModeTranscriptPlusAudio && !audioAvailable && hasTranscript:
+		return voiceModeTranscriptFirst
+	case mode == voiceModeAudioAnalysisRequest && !audioAvailable && hasTranscript:
+		return voiceModeTranscriptFirst
+	default:
+		return mode
+	}
+}
+
+func buildVoiceAgentInput(transcript, audioPath, mode string) string {
+	transcript = strings.TrimSpace(transcript)
+	audioPath = strings.TrimSpace(audioPath)
+
+	switch mode {
+	case voiceModeAudioAnalysisRequest:
+		if transcript != "" && audioPath != "" {
+			return fmt.Sprintf("收到一条微信语音。请优先参考微信转写，并结合原始音频继续分析。\n\n微信转写：\n%s\n\n原始音频路径：\n%s", transcript, audioPath)
+		}
+		if audioPath != "" {
+			return fmt.Sprintf("收到一条来自微信的语音，目前没有可用转写。请直接分析原始音频。\n%s", audioPath)
+		}
+	case voiceModeTranscriptPlusAudio:
+		if transcript != "" && audioPath != "" {
+			return fmt.Sprintf("以下内容来自微信语音转写：\n%s\n\n原始音频已保存到本地，可按需进一步分析：\n%s", transcript, audioPath)
+		}
+		if audioPath != "" {
+			return fmt.Sprintf("收到一条来自微信的语音，目前没有可用转写。原始音频已保存到本地：\n%s", audioPath)
+		}
+	}
+
+	if transcript != "" {
+		return "以下内容来自微信语音转写：\n" + transcript
+	}
+	if audioPath != "" {
+		return fmt.Sprintf("收到一条来自微信的语音，目前没有可用转写。原始音频已保存到本地：\n%s", audioPath)
+	}
+	return ""
+}
+
+func voiceModeExposesAudio(mode string) bool {
+	return mode == voiceModeTranscriptPlusAudio || mode == voiceModeAudioAnalysisRequest
+}
+
+func saveIncomingMediaFile(dir, fileName string, data []byte, sidecar obsidianarchive.Sidecar, messageID int64) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
 
-	filePath := filepath.Join(dir, fileName)
+	filePath, err := uniqueMediaPath(dir, fileName)
+	if err != nil {
+		return "", err
+	}
 	if err := os.WriteFile(filePath, data, 0o644); err != nil {
 		return "", err
 	}
 
 	sidecarPath := filePath + ".sidecar.md"
-	sidecarContent := fmt.Sprintf("---\nid: %s\n---\n", uuid.New().String())
-	if err := os.WriteFile(sidecarPath, []byte(sidecarContent), 0o644); err != nil {
+	sidecar.ID = uuid.New().String()
+	finalName := filepath.Base(filePath)
+	originalBase := strings.TrimSuffix(filepath.Base(fileName), filepath.Ext(fileName))
+	if sidecar.OriginalFilename == "" || sidecar.OriginalFilename == fileName {
+		sidecar.OriginalFilename = finalName
+	}
+	if sidecar.Title == "" || sidecar.Title == originalBase {
+		sidecar.Title = strings.TrimSuffix(finalName, filepath.Ext(finalName))
+	}
+	if err := obsidianarchive.SaveSidecar(sidecarPath, sidecar); err != nil {
 		log.Printf("[handler] failed to write sidecar: %v", err)
+	}
+
+	if sidecar.Source == "wechat" {
+		if err := obsidianarchive.RecordMedia(dir, sidecar.WechatUserID, messageID, sidecar, filePath); err != nil {
+			log.Printf("[handler] failed to record media session item: %v", err)
+		}
 	}
 
 	return filePath, nil
@@ -864,14 +1149,45 @@ func buildSavedMediaReply(mediaType, fileName string) string {
 	return fmt.Sprintf("已收到%s，已保存为 %s。正在继续处理。", mediaType, fileName)
 }
 
+func mediaTimestamp() string {
+	return time.Now().Format("20060102-150405.000")
+}
+
+func uniqueMediaPath(dir, fileName string) (string, error) {
+	base := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	ext := filepath.Ext(fileName)
+	candidate := filepath.Join(dir, fileName)
+	for i := 2; ; i++ {
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+		candidate = filepath.Join(dir, fmt.Sprintf("%s-%d%s", base, i, ext))
+	}
+}
+
 func sanitizeIncomingFileName(name string) string {
 	name = strings.TrimSpace(filepath.Base(name))
 	name = strings.ReplaceAll(name, string(os.PathSeparator), "_")
 	name = strings.ReplaceAll(name, "/", "_")
 	if name == "" || name == "." {
-		name = time.Now().Format("20060102-150405") + ".bin"
+		name = mediaTimestamp() + ".bin"
 	}
 	return name
+}
+
+func detectVoiceExt(voice *ilink.VoiceItem) string {
+	switch voice.EncodeType {
+	case 5:
+		return ".amr"
+	case 6:
+		return ".silk"
+	case 7:
+		return ".mp3"
+	default:
+		return ".audio"
+	}
 }
 
 func describeMessageItems(msg ilink.WeixinMessage) string {

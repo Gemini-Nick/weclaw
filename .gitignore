@@ -21,3 +21,7 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Local build caches
+.gocache/
+.gomodcache/
