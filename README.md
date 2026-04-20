@@ -56,11 +56,17 @@ Auto-detection picks ACP over CLI when both are available.
 
 ## Architecture Boundary
 
-WeClaw is the WeChat bridge core, not the full desktop product shell.
+WeClaw is the WeChat bridge core. In downstream products such as Longclaw it
+acts as the `remote cowork companion`, not the default home and not the full
+governance console.
 
-- Keep in `weclaw`: WeChat message semantics, media parsing, transcript-first voice normalization, session/media facts, canonical agent input, and archive tool contracts.
-- Keep out of `weclaw`: launchd/process supervision, TLS preflight, desktop UI, installer flows, and environment-specific runtime policies.
+- Keep in `weclaw`: WeChat message semantics, media parsing, transcript-first voice normalization, session/media facts, canonical agent input, lightweight remote launch, and reviewed handoff compatibility contracts.
+- Keep out of `weclaw`: launchd/process supervision, TLS preflight, desktop UI, installer flows, evidence review, repair workflows, and environment-specific runtime policies.
 - Downstream products should integrate through stable interfaces such as `~/.weclaw/config.json`, the `weclaw` CLI, and workspace/session/sidecar files.
+
+Product rule downstream:
+
+- `Chat launches, console governs.`
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the detailed boundary.
 Fork maintenance guidance lives in [docs/FORK_MAINTENANCE.md](docs/FORK_MAINTENANCE.md).
@@ -197,11 +203,16 @@ Config file: `~/.weclaw/config.json`
 
 Environment variables:
 - `WECLAW_DEFAULT_AGENT` — override default agent
+- `WECLAW_AGENT_OS_BASE_URL` / `LONGCLAW_AGENT_OS_BASE_URL` — forward inbound WeChat events and explicit `@pack` / `@skill` / `@plugin` launches into Hermes Agent OS
+- `WECLAW_AGENT_OS_API_KEY` / `LONGCLAW_AGENT_OS_API_KEY` — bearer token for the Hermes Agent OS API
+- `WECLAW_CANONICAL_USER_ID` / `LONGCLAW_CANONICAL_USER_ID` — stable cross-channel user id for canonical session linking
+- `WECLAW_DEFAULT_LAUNCH_PACK` / `LONGCLAW_DEFAULT_LAUNCH_PACK` — default Hermes pack for free-text launches without an explicit `@pack`
+- `WECLAW_DEFAULT_LAUNCH_CAPABILITY` / `LONGCLAW_DEFAULT_LAUNCH_CAPABILITY` — optional default capability paired with the default launch pack
 - `OPENCLAW_GATEWAY_URL` — OpenClaw HTTP fallback endpoint
 - `OPENCLAW_GATEWAY_TOKEN` — OpenClaw API token
 - `WECLAW_VOICE_INPUT_MODE_DEFAULT` — default voice normalization mode
-- `WECLAW_ARCHIVE_TOOL_ENABLED` — enable or disable archive tool handling
-- `WECLAW_OBSIDIAN_FORMAL_WRITE_ENABLED` — allow formal Obsidian writes
+- `WECLAW_ARCHIVE_TOOL_ENABLED` — enable or disable the reviewed handoff compatibility path
+- `WECLAW_OBSIDIAN_FORMAL_WRITE_ENABLED` — allow reviewed handoff writes into Obsidian; legacy name retained for compatibility
 - `WECLAW_AGENT_INPUT_POLICY` — select the canonical agent input policy
 
 Custom agent CLI environment variables:

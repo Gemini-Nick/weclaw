@@ -57,6 +57,10 @@ func newTestILinkServer(t *testing.T) (*httptest.Server, *[]string) {
 		durableSeenMessagesRootOverride = t.TempDir()
 		t.Cleanup(func() { durableSeenMessagesRootOverride = "" })
 	}
+	if contextTokensPathOverride == "" {
+		contextTokensPathOverride = filepath.Join(t.TempDir(), "context_tokens.json")
+		t.Cleanup(func() { contextTokensPathOverride = "" })
+	}
 
 	var sent []string
 	var mu sync.Mutex
@@ -215,6 +219,169 @@ func TestBuildHelpText(t *testing.T) {
 	}
 	if !strings.Contains(text, "/help") {
 		t.Error("help text should mention /help")
+	}
+	if !strings.Contains(text, "任务:") {
+		t.Error("help text should mention queued task prefix")
+	}
+	if !strings.Contains(text, "/runtime") {
+		t.Error("help text should mention /runtime")
+	}
+}
+
+func TestHandleMessage_QueuedTaskPrefixEnqueuesWithoutDispatch(t *testing.T) {
+	srv, sent := newTestILinkServer(t)
+	defer srv.Close()
+
+	queueFile := filepath.Join(t.TempDir(), "wechat-task-queue.json")
+	t.Setenv("LONGCLAW_WECHAT_TASK_QUEUE_FILE", queueFile)
+
+	ag := &fakeAgent{reply: "should not run"}
+	h := newTestHandler()
+	h.SetDefaultAgent("codex", ag)
+
+	client := ilink.NewClient(&ilink.Credentials{
+		BaseURL:    srv.URL,
+		BotToken:   "token",
+		ILinkBotID: "bot@im.bot",
+	})
+
+	msg := ilink.WeixinMessage{
+		MessageID:    188,
+		FromUserID:   "user@im.wechat",
+		MessageType:  ilink.MessageTypeUser,
+		MessageState: ilink.MessageStateFinish,
+		ContextToken: "ctx",
+		ItemList: []ilink.MessageItem{
+			{Type: ilink.ItemTypeText, TextItem: &ilink.TextItem{Text: "任务: 帮我检查 runtime queue"}},
+		},
+	}
+
+	h.HandleMessage(context.Background(), client, msg)
+
+	if got := len(ag.messages); got != 0 {
+		t.Fatalf("expected no agent dispatch, got %d (%v)", got, ag.messages)
+	}
+	if got := len(*sent); got != 1 {
+		t.Fatalf("expected 1 outgoing ack, got %d (%v)", got, *sent)
+	}
+	if !strings.Contains((*sent)[0], "任务已排队") {
+		t.Fatalf("expected queued task ack, got %q", (*sent)[0])
+	}
+
+	data, err := os.ReadFile(queueFile)
+	if err != nil {
+		t.Fatalf("read queue file: %v", err)
+	}
+	var state TaskQueueState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("unmarshal queue: %v", err)
+	}
+	if len(state.Tasks) != 1 {
+		t.Fatalf("expected 1 queued task, got %d", len(state.Tasks))
+	}
+	if state.Tasks[0].TaskText != "帮我检查 runtime queue" {
+		t.Fatalf("unexpected queued task text: %q", state.Tasks[0].TaskText)
+	}
+}
+
+func TestDispatchQueuedTask_DefaultAgentSendsReply(t *testing.T) {
+	srv, sent := newTestILinkServer(t)
+	defer srv.Close()
+
+	ag := &fakeAgent{reply: "runtime 已检查完毕"}
+	h := newTestHandler()
+	h.SetDefaultAgent("codex", ag)
+
+	client := ilink.NewClient(&ilink.Credentials{
+		BaseURL:    srv.URL,
+		BotToken:   "token",
+		ILinkBotID: "bot@im.bot",
+	})
+
+	result, err := h.DispatchQueuedTask(context.Background(), client, "user@im.wechat", "帮我检查 runtime queue")
+	if err != nil {
+		t.Fatalf("DispatchQueuedTask returned error: %v", err)
+	}
+	if result.Agent != "codex" {
+		t.Fatalf("expected agent codex, got %q", result.Agent)
+	}
+	if !strings.Contains(ag.lastMessage(), "帮我检查 runtime queue") {
+		t.Fatalf("expected agent to receive task text, got %q", ag.lastMessage())
+	}
+	if got := len(*sent); got != 1 {
+		t.Fatalf("expected 1 outgoing reply, got %d (%v)", got, *sent)
+	}
+	if !strings.Contains((*sent)[0], "runtime 已检查完毕") {
+		t.Fatalf("expected task reply, got %q", (*sent)[0])
+	}
+}
+
+func TestHandleMessage_RuntimeStatusReply(t *testing.T) {
+	srv, sent := newTestILinkServer(t)
+	defer srv.Close()
+
+	queueFile := filepath.Join(t.TempDir(), "roadmap-queue.json")
+	t.Setenv("LONGCLAW_ROADMAP_QUEUE_FILE", queueFile)
+	if err := os.WriteFile(queueFile, []byte(`{
+  "generated_at": "2026-04-08T00:00:00-07:00",
+  "most_worth_watching": "weclaw delivery window unavailable",
+  "routing": {
+    "effective_agent": "codex",
+    "preferred_primary": "codex",
+    "preferred_backup": "claude"
+  },
+  "delivery_policy": {
+    "wechat_delivery_mode": "reply",
+    "summary_delivery_result": {
+      "status": "local_only"
+    }
+  },
+  "task_queue": {
+    "counts": {
+      "pending": 2
+    }
+  },
+  "blocked_items": ["one"],
+  "pending_reviews": ["two", "three"]
+}`), 0o644); err != nil {
+		t.Fatalf("write queue file: %v", err)
+	}
+
+	h := newTestHandler()
+	h.SetDefaultAgent("codex", &fakeAgent{reply: "should not run"})
+	client := ilink.NewClient(&ilink.Credentials{
+		BaseURL:    srv.URL,
+		BotToken:   "token",
+		ILinkBotID: "bot@im.bot",
+	})
+
+	msg := ilink.WeixinMessage{
+		MessageID:    201,
+		FromUserID:   "user@im.wechat",
+		MessageType:  ilink.MessageTypeUser,
+		MessageState: ilink.MessageStateFinish,
+		ContextToken: "ctx",
+		ItemList: []ilink.MessageItem{
+			{Type: ilink.ItemTypeText, TextItem: &ilink.TextItem{Text: "/runtime"}},
+		},
+	}
+
+	h.HandleMessage(context.Background(), client, msg)
+
+	if got := len(*sent); got != 1 {
+		t.Fatalf("expected 1 runtime reply, got %d (%v)", got, *sent)
+	}
+	reply := (*sent)[0]
+	for _, needle := range []string{
+		"Longclaw Runtime",
+		"effective_agent: codex",
+		"wechat_delivery_mode: reply",
+		"summary_delivery_status: local_only",
+		"pending_tasks: 2",
+	} {
+		if !strings.Contains(reply, needle) {
+			t.Fatalf("expected %q in runtime reply, got %q", needle, reply)
+		}
 	}
 }
 

@@ -17,7 +17,12 @@ type contextTokenDB struct {
 	Tokens map[string]contextTokenRecord `json:"tokens"`
 }
 
+var contextTokensPathOverride string
+
 func contextTokensPath() (string, error) {
+	if contextTokensPathOverride != "" {
+		return contextTokensPathOverride, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve home dir: %w", err)

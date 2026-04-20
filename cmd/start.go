@@ -153,6 +153,18 @@ func runStart(cmd *cobra.Command, args []string) error {
 		handler.SetPersonaDir(cfg.PersonaDir)
 		log.Printf("Persona asset directory: %s", cfg.PersonaDir)
 	}
+	if cfg.AgentOSBaseURL != "" {
+		handler.SetAgentOSEventSink(
+			messaging.NewAgentOSEventSink(
+				cfg.AgentOSBaseURL,
+				cfg.AgentOSAPIKey,
+				cfg.CanonicalUserID,
+				cfg.DefaultLaunchPack,
+				cfg.DefaultLaunchCapability,
+			),
+		)
+		log.Printf("Agent OS ingress enabled: %s", cfg.AgentOSBaseURL)
+	}
 
 	// Start default agent initialization in background so monitors can start immediately
 	go func() {
@@ -179,7 +191,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if apiAddrFlag != "" {
 		apiAddr = apiAddrFlag
 	}
-	apiServer := api.NewServer(clients, apiAddr)
+	apiServer := api.NewServer(clients, apiAddr, handler)
 	go func() {
 		if err := apiServer.Run(ctx); err != nil {
 			log.Printf("API server error: %v", err)

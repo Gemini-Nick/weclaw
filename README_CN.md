@@ -188,6 +188,11 @@ curl -X POST http://127.0.0.1:18011/api/send \
 环境变量：
 
 - `WECLAW_DEFAULT_AGENT` — 覆盖默认 Agent
+- `WECLAW_AGENT_OS_BASE_URL` / `LONGCLAW_AGENT_OS_BASE_URL` — 将微信入站事件以及显式 `@pack` / `@skill` / `@plugin` 启动请求转发到 Hermes Agent OS
+- `WECLAW_AGENT_OS_API_KEY` / `LONGCLAW_AGENT_OS_API_KEY` — Hermes Agent OS API 的 Bearer Token
+- `WECLAW_CANONICAL_USER_ID` / `LONGCLAW_CANONICAL_USER_ID` — 跨微信/语音统一 session 时使用的稳定用户 ID
+- `WECLAW_DEFAULT_LAUNCH_PACK` / `LONGCLAW_DEFAULT_LAUNCH_PACK` — 对未显式声明 `@pack` 的自由文本启动请求，指定默认 Hermes pack
+- `WECLAW_DEFAULT_LAUNCH_CAPABILITY` / `LONGCLAW_DEFAULT_LAUNCH_CAPABILITY` — 与默认 launch pack 配套的可选默认 capability
 - `OPENCLAW_GATEWAY_URL` — OpenClaw HTTP 回退地址
 - `OPENCLAW_GATEWAY_TOKEN` — OpenClaw API Token
 

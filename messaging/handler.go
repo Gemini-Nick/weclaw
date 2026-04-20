@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -33,19 +34,20 @@ type AgentMeta struct {
 
 // Handler processes incoming WeChat messages and dispatches replies.
 type Handler struct {
-	mu            sync.RWMutex
-	defaultName   string
-	agents        map[string]agent.Agent // name -> running agent
-	agentMetas    []AgentMeta            // all configured agents (for /status)
-	agentWorkDirs map[string]string      // agent name -> configured/runtime cwd
-	customAliases map[string]string      // custom alias -> agent name (from config)
-	factory       AgentFactory
-	saveDefault   SaveDefaultFunc
-	contextTokens sync.Map // map[userID]contextToken
-	saveDir       string   // directory to save images/files to
-	personaDir    string   // directory with persona assets + manifest
-	cfg           *config.Config
-	seenMsgs      sync.Map // map[string]time.Time — dedup by user_id + message_id
+	mu               sync.RWMutex
+	defaultName      string
+	agents           map[string]agent.Agent // name -> running agent
+	agentMetas       []AgentMeta            // all configured agents (for /status)
+	agentWorkDirs    map[string]string      // agent name -> configured/runtime cwd
+	customAliases    map[string]string      // custom alias -> agent name (from config)
+	factory          AgentFactory
+	saveDefault      SaveDefaultFunc
+	contextTokens    sync.Map // map[userID]contextToken
+	saveDir          string   // directory to save images/files to
+	personaDir       string   // directory with persona assets + manifest
+	cfg              *config.Config
+	agentOSEventSink *AgentOSEventSink
+	seenMsgs         sync.Map // map[string]time.Time — dedup by user_id + message_id
 }
 
 const (
@@ -76,6 +78,10 @@ func (h *Handler) SetPersonaDir(dir string) {
 
 func (h *Handler) SetConfig(cfg *config.Config) {
 	h.cfg = cfg
+}
+
+func (h *Handler) SetAgentOSEventSink(sink *AgentOSEventSink) {
+	h.agentOSEventSink = sink
 }
 
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
@@ -379,6 +385,7 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	}
 
 	log.Printf("[handler] received from %s: %q", msg.FromUserID, truncate(text, 80))
+	h.reportAgentOSIngress(msg, text)
 
 	// Generate a clientID for this reply (used to correlate typing → finish)
 	clientID := NewClientID()
@@ -410,6 +417,10 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		reply := h.buildStatus()
 		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindStatus)
 		return
+	} else if trimmed == "/runtime" {
+		reply := buildRuntimeStatusReply()
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindStatus)
+		return
 	} else if trimmed == "/help" {
 		reply := buildHelpText()
 		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindHelp)
@@ -423,12 +434,24 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindStatus)
 		return
 	}
+	if taskText, ok := ExtractQueuedTask(trimmed); ok {
+		task, err := EnqueueQueuedTask(msg, trimmed, taskText)
+		if err != nil {
+			log.Printf("[handler] failed to enqueue queued task from %s: %v", msg.FromUserID, err)
+			h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), fmt.Sprintf("任务排队失败：%v", err), clientID, replyKindError)
+			return
+		}
+		reply := fmt.Sprintf("任务已排队\nid: %s\n将在当前轮结束后执行", task.ID)
+		h.sendStructuredTextReply(ctx, client, msg, h.getDefaultAgentName(), reply, clientID, replyKindStatus)
+		return
+	}
 
 	// Route: "/agentname message" or "@agent1 @agent2 message" -> specific agent(s)
 	agentNames, message := h.parseCommand(text)
 
 	// No command prefix -> send to default agent
 	if len(agentNames) == 0 {
+		h.reportAgentOSLaunch(msg, text, nil)
 		h.sendToDefaultAgent(ctx, client, msg, text, clientID)
 		return
 	}
@@ -457,9 +480,12 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	}
 	if len(knownNames) == 0 {
 		// No known agents -> forward entire text to default agent
+		h.reportAgentOSLaunch(msg, text, nil)
 		h.sendToDefaultAgent(ctx, client, msg, text, clientID)
 		return
 	}
+
+	h.reportAgentOSLaunch(msg, message, knownNames)
 
 	// Send typing indicator
 	go func() {
@@ -475,6 +501,198 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		// Multi-agent broadcast: parallel dispatch, send replies as they arrive
 		h.broadcastToAgents(ctx, client, msg, knownNames, message)
 	}
+}
+
+type DispatchTaskResult struct {
+	Mode         string
+	Agent        string
+	ReplyPreview string
+}
+
+func (h *Handler) DispatchQueuedTask(ctx context.Context, client *ilink.Client, userID, text string) (*DispatchTaskResult, error) {
+	contextToken, _ := LookupContextToken(userID)
+	msg := ilink.WeixinMessage{
+		FromUserID:   userID,
+		MessageType:  ilink.MessageTypeUser,
+		MessageState: ilink.MessageStateFinish,
+		ContextToken: contextToken,
+	}
+	clientID := NewClientID()
+
+	go func() {
+		if typingErr := SendTypingState(ctx, client, userID, contextToken); typingErr != nil {
+			log.Printf("[handler] failed to send queued-task typing state: %v", typingErr)
+		}
+	}()
+
+	agentNames, message := h.parseCommand(text)
+	if len(agentNames) == 0 {
+		defaultName := h.getDefaultAgentName()
+		ag := h.getDefaultAgent()
+		if ag == nil {
+			reply := "[echo] " + text
+			h.sendReplyWithMedia(ctx, client, msg, defaultName, reply, clientID)
+			return &DispatchTaskResult{
+				Mode:         "default_agent",
+				Agent:        defaultName,
+				ReplyPreview: truncate(reply, 120),
+			}, nil
+		}
+		reply, err := h.chatWithAgentWithTools(ctx, ag, msg, defaultName, text)
+		if err != nil {
+			reply = fmt.Sprintf("Error: %v", err)
+			h.sendReplyWithMedia(ctx, client, msg, defaultName, reply, clientID)
+			return &DispatchTaskResult{
+				Mode:         "default_agent",
+				Agent:        defaultName,
+				ReplyPreview: truncate(reply, 120),
+			}, err
+		}
+		h.sendReplyWithMedia(ctx, client, msg, defaultName, reply, clientID)
+		return &DispatchTaskResult{
+			Mode:         "default_agent",
+			Agent:        defaultName,
+			ReplyPreview: truncate(reply, 120),
+		}, nil
+	}
+
+	if strings.TrimSpace(message) == "" {
+		return nil, fmt.Errorf("queued task missing message body after agent prefix")
+	}
+
+	var knownNames []string
+	for _, name := range agentNames {
+		if h.isKnownAgent(name) {
+			knownNames = append(knownNames, name)
+		}
+	}
+	if len(knownNames) == 0 {
+		defaultName := h.getDefaultAgentName()
+		ag := h.getDefaultAgent()
+		if ag == nil {
+			reply := "[echo] " + text
+			h.sendReplyWithMedia(ctx, client, msg, defaultName, reply, clientID)
+			return &DispatchTaskResult{
+				Mode:         "default_agent",
+				Agent:        defaultName,
+				ReplyPreview: truncate(reply, 120),
+			}, nil
+		}
+		reply, err := h.chatWithAgentWithTools(ctx, ag, msg, defaultName, text)
+		if err != nil {
+			reply = fmt.Sprintf("Error: %v", err)
+			h.sendReplyWithMedia(ctx, client, msg, defaultName, reply, clientID)
+			return &DispatchTaskResult{
+				Mode:         "default_agent",
+				Agent:        defaultName,
+				ReplyPreview: truncate(reply, 120),
+			}, err
+		}
+		h.sendReplyWithMedia(ctx, client, msg, defaultName, reply, clientID)
+		return &DispatchTaskResult{
+			Mode:         "default_agent",
+			Agent:        defaultName,
+			ReplyPreview: truncate(reply, 120),
+		}, nil
+	}
+
+	if len(knownNames) == 1 {
+		name := knownNames[0]
+		ag, err := h.getAgent(ctx, name)
+		if err != nil {
+			reply := fmt.Sprintf("Agent %q is not available: %v", name, err)
+			h.sendStructuredTextReply(ctx, client, msg, name, reply, clientID, replyKindError)
+			return &DispatchTaskResult{
+				Mode:         "named_agent",
+				Agent:        name,
+				ReplyPreview: truncate(reply, 120),
+			}, err
+		}
+		reply, err := h.chatWithAgentWithTools(ctx, ag, msg, name, message)
+		if err != nil {
+			reply = fmt.Sprintf("Error: %v", err)
+			h.sendReplyWithMedia(ctx, client, msg, name, reply, clientID)
+			return &DispatchTaskResult{
+				Mode:         "named_agent",
+				Agent:        name,
+				ReplyPreview: truncate(reply, 120),
+			}, err
+		}
+		h.sendReplyWithMedia(ctx, client, msg, name, reply, clientID)
+		return &DispatchTaskResult{
+			Mode:         "named_agent",
+			Agent:        name,
+			ReplyPreview: truncate(reply, 120),
+		}, nil
+	}
+
+	h.broadcastToAgents(ctx, client, msg, knownNames, message)
+	return &DispatchTaskResult{
+		Mode:         "multi_agent_broadcast",
+		Agent:        strings.Join(knownNames, ","),
+		ReplyPreview: fmt.Sprintf("broadcast sent to %s", strings.Join(knownNames, ",")),
+	}, nil
+}
+
+func (h *Handler) reportAgentOSIngress(msg ilink.WeixinMessage, text string) {
+	go func() {
+		reqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := h.submitAgentOSIngress(reqCtx, msg, text); err != nil {
+			log.Printf("[handler] agent-os ingress failed message_id=%d from=%s: %v", msg.MessageID, msg.FromUserID, err)
+		}
+	}()
+}
+
+func (h *Handler) reportAgentOSLaunch(msg ilink.WeixinMessage, text string, targetAgents []string) {
+	go func() {
+		reqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := h.submitAgentOSLaunch(reqCtx, msg, text, targetAgents); err != nil {
+			log.Printf("[handler] agent-os launch failed message_id=%d from=%s: %v", msg.MessageID, msg.FromUserID, err)
+		}
+	}()
+}
+
+func (h *Handler) submitAgentOSIngress(ctx context.Context, msg ilink.WeixinMessage, text string) error {
+	sink := h.agentOSEventSink
+	if sink == nil {
+		return fmt.Errorf("agent-os sink not configured")
+	}
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	return sink.ReportIngress(ctx, msg, text, h.getDefaultAgentName())
+}
+
+func (h *Handler) submitAgentOSLaunch(
+	ctx context.Context,
+	msg ilink.WeixinMessage,
+	text string,
+	targetAgents []string,
+) error {
+	sink := h.agentOSEventSink
+	if sink == nil {
+		return fmt.Errorf("agent-os sink not configured")
+	}
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	return sink.SubmitLaunch(ctx, msg, text, h.getDefaultAgentName(), targetAgents)
+}
+
+func (h *Handler) SubmitAgentOSFrontDoor(
+	ctx context.Context,
+	msg ilink.WeixinMessage,
+	text string,
+	targetAgents []string,
+) error {
+	if err := h.submitAgentOSIngress(ctx, msg, text); err != nil {
+		return err
+	}
+	return h.submitAgentOSLaunch(ctx, msg, text, targetAgents)
 }
 
 // sendToDefaultAgent sends the message to the default agent and replies.
@@ -809,11 +1027,111 @@ func (h *Handler) buildStatus() string {
 	return fmt.Sprintf("agent: %s\ntype: %s\nmodel: %s", h.defaultName, info.Type, info.Model)
 }
 
+func runtimeQueuePath() string {
+	if override := strings.TrimSpace(os.Getenv("LONGCLAW_ROADMAP_QUEUE_FILE")); override != "" {
+		return override
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".longclaw", "runtime-v2", "state", "roadmap-queue.json")
+}
+
+func nestedMap(data map[string]any, key string) map[string]any {
+	value, ok := data[key]
+	if !ok {
+		return map[string]any{}
+	}
+	if mapped, ok := value.(map[string]any); ok {
+		return mapped
+	}
+	return map[string]any{}
+}
+
+func stringValue(data map[string]any, key string, fallback string) string {
+	value, ok := data[key]
+	if !ok || value == nil {
+		return fallback
+	}
+	if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+		return text
+	}
+	return fallback
+}
+
+func intValue(value any) int {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	default:
+		return 0
+	}
+}
+
+func buildRuntimeStatusReply() string {
+	path := runtimeQueuePath()
+	if path == "" {
+		return "runtime 状态暂不可用：无法定位 roadmap queue"
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("runtime 状态暂不可用：%v", err)
+	}
+
+	var queue map[string]any
+	if err := json.Unmarshal(data, &queue); err != nil {
+		return fmt.Sprintf("runtime 状态暂不可用：queue 解析失败: %v", err)
+	}
+
+	routing := nestedMap(queue, "routing")
+	taskQueue := nestedMap(queue, "task_queue")
+	taskCounts := nestedMap(taskQueue, "counts")
+	delivery := nestedMap(queue, "delivery_policy")
+	summaryDelivery := nestedMap(delivery, "summary_delivery_result")
+
+	lines := []string{
+		"Longclaw Runtime",
+		fmt.Sprintf("generated_at: %s", stringValue(queue, "generated_at", "unknown")),
+		fmt.Sprintf("effective_agent: %s", stringValue(routing, "effective_agent", "unknown")),
+		fmt.Sprintf(
+			"primary/backup: %s / %s",
+			stringValue(routing, "preferred_primary", "unknown"),
+			stringValue(routing, "preferred_backup", "unknown"),
+		),
+		fmt.Sprintf("most_worth_watching: %s", stringValue(queue, "most_worth_watching", "unknown")),
+		fmt.Sprintf("wechat_delivery_mode: %s", stringValue(delivery, "wechat_delivery_mode", "unknown")),
+		fmt.Sprintf("summary_delivery_status: %s", stringValue(summaryDelivery, "status", "unknown")),
+		fmt.Sprintf("pending_tasks: %d", intValue(taskCounts["pending"])),
+		fmt.Sprintf("blocked_items: %d", len(asStringSlice(queue["blocked_items"]))),
+		fmt.Sprintf("pending_reviews: %d", len(asStringSlice(queue["pending_reviews"]))),
+	}
+	return strings.Join(lines, "\n")
+}
+
+func asStringSlice(value any) []string {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
+			result = append(result, text)
+		}
+	}
+	return result
+}
+
 func buildHelpText() string {
 	return `Available commands:
 @agent or /agent - Switch default agent
 @agent msg or /agent msg - Send to a specific agent
 @a @b msg - Broadcast to multiple agents
+任务: xxx - Queue a runtime task after the current self-repair round
+/runtime - Show the latest Longclaw runtime status
 /new or /clear - Start a new session
 /cwd /path - Switch workspace directory
 /info - Show current agent info

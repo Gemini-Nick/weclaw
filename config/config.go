@@ -13,6 +13,11 @@ import (
 type Config struct {
 	DefaultAgent                 string                 `json:"default_agent"`
 	APIAddr                      string                 `json:"api_addr,omitempty"`
+	AgentOSBaseURL               string                 `json:"agent_os_base_url,omitempty"`
+	AgentOSAPIKey                string                 `json:"agent_os_api_key,omitempty"`
+	CanonicalUserID              string                 `json:"canonical_user_id,omitempty"`
+	DefaultLaunchPack            string                 `json:"default_launch_pack,omitempty"`
+	DefaultLaunchCapability      string                 `json:"default_launch_capability,omitempty"`
 	SaveDir                      string                 `json:"save_dir,omitempty"`
 	PersonaDir                   string                 `json:"persona_dir,omitempty"`
 	VoiceInputModeDefault        string                 `json:"voice_input_mode_default,omitempty"`
@@ -184,6 +189,21 @@ func loadEnv(cfg *Config) {
 	if v := os.Getenv("WECLAW_API_ADDR"); v != "" {
 		cfg.APIAddr = v
 	}
+	if v := firstNonEmptyEnv("WECLAW_AGENT_OS_BASE_URL", "LONGCLAW_AGENT_OS_BASE_URL"); v != "" {
+		cfg.AgentOSBaseURL = v
+	}
+	if v := firstNonEmptyEnv("WECLAW_AGENT_OS_API_KEY", "LONGCLAW_AGENT_OS_API_KEY"); v != "" {
+		cfg.AgentOSAPIKey = v
+	}
+	if v := firstNonEmptyEnv("WECLAW_CANONICAL_USER_ID", "LONGCLAW_CANONICAL_USER_ID"); v != "" {
+		cfg.CanonicalUserID = v
+	}
+	if v := firstNonEmptyEnv("WECLAW_DEFAULT_LAUNCH_PACK", "LONGCLAW_DEFAULT_LAUNCH_PACK"); v != "" {
+		cfg.DefaultLaunchPack = v
+	}
+	if v := firstNonEmptyEnv("WECLAW_DEFAULT_LAUNCH_CAPABILITY", "LONGCLAW_DEFAULT_LAUNCH_CAPABILITY"); v != "" {
+		cfg.DefaultLaunchCapability = v
+	}
 	if v := os.Getenv("WECLAW_SAVE_DIR"); v != "" {
 		cfg.SaveDir = v
 	}
@@ -240,6 +260,15 @@ func loadEnv(cfg *Config) {
 	if v := os.Getenv("WECLAW_AGENT_INPUT_POLICY"); v != "" {
 		cfg.AgentInputPolicy = v
 	}
+}
+
+func firstNonEmptyEnv(keys ...string) string {
+	for _, key := range keys {
+		if value := os.Getenv(key); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // Save saves the configuration to disk.
