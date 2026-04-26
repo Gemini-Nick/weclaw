@@ -11,11 +11,13 @@ import (
 )
 
 const (
-	maxConsecutiveFailures = 5
-	initialBackoff         = 3 * time.Second
-	maxBackoff             = 60 * time.Second
-	sessionExpiredBackoff  = 5 * time.Second
-	errCodeSessionExpired  = -14
+	maxConsecutiveFailures             = 5
+	initialBackoff                     = 3 * time.Second
+	maxBackoff                         = 60 * time.Second
+	sessionExpiredBackoff              = 5 * time.Second
+	unrecoverableSessionExpiredBackoff = 60 * time.Second
+	sessionExpiredWarningInterval      = 15 * time.Minute
+	errCodeSessionExpired              = -14
 )
 
 // MessageHandler is called for each received message.
@@ -23,12 +25,16 @@ type MessageHandler func(ctx context.Context, client *Client, msg WeixinMessage)
 
 // Monitor manages the long-poll loop for receiving messages.
 type Monitor struct {
-	client        *Client
-	handler       MessageHandler
-	getUpdatesBuf string
-	bufPath       string
-	failures      int
-	lastActivity  time.Time
+	client                       *Client
+	handler                      MessageHandler
+	accountID                    string
+	getUpdatesBuf                string
+	bufPath                      string
+	sessionStatePath             string
+	failures                     int
+	lastActivity                 time.Time
+	lastSessionExpiredWarning    time.Time
+	sessionExpiredSuppressedLogs int
 }
 
 // NewMonitor creates a new long-poll monitor.
@@ -39,12 +45,15 @@ func NewMonitor(client *Client, handler MessageHandler) (*Monitor, error) {
 	}
 	accountID := NormalizeAccountID(client.BotID())
 	bufPath := filepath.Join(home, ".weclaw", "accounts", accountID+".sync.json")
+	sessionStatePath := filepath.Join(home, ".weclaw", "runtime", "session_state", accountID+".json")
 
 	m := &Monitor{
-		client:       client,
-		handler:      handler,
-		bufPath:      bufPath,
-		lastActivity: time.Now(),
+		client:           client,
+		handler:          handler,
+		accountID:        accountID,
+		bufPath:          bufPath,
+		sessionStatePath: sessionStatePath,
+		lastActivity:     time.Now(),
 	}
 	m.loadBuf()
 	return m, nil
@@ -89,14 +98,23 @@ func (m *Monitor) Run(ctx context.Context) error {
 
 		// Session expired — reset sync buf and reconnect silently
 		if resp.ErrCode == errCodeSessionExpired {
+			now := time.Now()
 			if m.getUpdatesBuf != "" {
 				log.Printf("[monitor] session expired, resetting sync buf")
 				m.getUpdatesBuf = ""
 				m.saveBuf()
+				m.writeSessionStatus("recovering", "sync buffer reset after session expired", now, sessionExpiredBackoff)
 			} else {
 				// Sync buf already empty but still getting session expired:
 				// the bot token itself has expired. The user needs to re-login.
-				log.Printf("[monitor] WARNING: WeChat session expired and cannot be auto-recovered. Run `weclaw login` to re-authenticate.")
+				m.logSessionExpiredWarning(now)
+				m.writeSessionStatus("login_required", "WeChat session expired and cannot be auto-recovered. Run `weclaw login` to re-authenticate.", now, unrecoverableSessionExpiredBackoff)
+				select {
+				case <-time.After(unrecoverableSessionExpiredBackoff):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				continue
 			}
 			select {
 			case <-time.After(sessionExpiredBackoff):
@@ -122,6 +140,63 @@ func (m *Monitor) Run(ctx context.Context) error {
 		for _, msg := range resp.Msgs {
 			go m.handler(ctx, m.client, msg)
 		}
+	}
+}
+
+func (m *Monitor) logSessionExpiredWarning(now time.Time) {
+	if m.lastSessionExpiredWarning.IsZero() || now.Sub(m.lastSessionExpiredWarning) >= sessionExpiredWarningInterval {
+		if m.sessionExpiredSuppressedLogs > 0 {
+			log.Printf("[monitor] WARNING: WeChat session expired and cannot be auto-recovered. Run `weclaw login` to re-authenticate. Suppressed %d duplicate warnings.", m.sessionExpiredSuppressedLogs)
+		} else {
+			log.Printf("[monitor] WARNING: WeChat session expired and cannot be auto-recovered. Run `weclaw login` to re-authenticate.")
+		}
+		m.lastSessionExpiredWarning = now
+		m.sessionExpiredSuppressedLogs = 0
+		return
+	}
+	m.sessionExpiredSuppressedLogs++
+}
+
+type sessionStatus struct {
+	AccountID          string `json:"account_id"`
+	Status             string `json:"status"`
+	UpdatedAt          string `json:"updated_at"`
+	Message            string `json:"message,omitempty"`
+	NextRetryAt        string `json:"next_retry_at,omitempty"`
+	SuppressedWarnings int    `json:"suppressed_warnings,omitempty"`
+}
+
+func (m *Monitor) writeSessionStatus(status, message string, now time.Time, retryAfter time.Duration) {
+	if m.sessionStatePath == "" {
+		return
+	}
+	state := sessionStatus{
+		AccountID:          m.accountID,
+		Status:             status,
+		UpdatedAt:          now.Format(time.RFC3339),
+		Message:            message,
+		SuppressedWarnings: m.sessionExpiredSuppressedLogs,
+	}
+	if retryAfter > 0 {
+		state.NextRetryAt = now.Add(retryAfter).Format(time.RFC3339)
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		log.Printf("[monitor] failed to marshal session status: %v", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(m.sessionStatePath), 0o700); err != nil {
+		log.Printf("[monitor] failed to create session status dir: %v", err)
+		return
+	}
+	tmp := m.sessionStatePath + ".tmp"
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+		log.Printf("[monitor] failed to write session status: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, m.sessionStatePath); err != nil {
+		log.Printf("[monitor] failed to replace session status: %v", err)
 	}
 }
 

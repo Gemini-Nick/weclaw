@@ -15,6 +15,7 @@ type Config struct {
 	APIAddr                      string                 `json:"api_addr,omitempty"`
 	AgentOSBaseURL               string                 `json:"agent_os_base_url,omitempty"`
 	AgentOSAPIKey                string                 `json:"agent_os_api_key,omitempty"`
+	AgentOSLaunchPolicy          string                 `json:"agent_os_launch_policy,omitempty"`
 	CanonicalUserID              string                 `json:"canonical_user_id,omitempty"`
 	DefaultLaunchPack            string                 `json:"default_launch_pack,omitempty"`
 	DefaultLaunchCapability      string                 `json:"default_launch_capability,omitempty"`
@@ -91,6 +92,7 @@ func BuildAliasMap(agents map[string]AgentConfig) map[string]string {
 func DefaultConfig() *Config {
 	return &Config{
 		Agents:                       make(map[string]AgentConfig),
+		AgentOSLaunchPolicy:          "off",
 		VoiceInputModeDefault:        "transcript_first",
 		ArchiveToolEnabled:           true,
 		ObsidianEnabled:              true,
@@ -150,6 +152,12 @@ func Load() (*Config, error) {
 }
 
 func applyDefaults(cfg *Config) {
+	if cfg.AgentOSLaunchPolicy == "" {
+		cfg.AgentOSLaunchPolicy = "off"
+	}
+	if cfg.SaveDir == "" {
+		cfg.SaveDir = defaultSaveDir()
+	}
 	if cfg.VoiceInputModeDefault == "" {
 		cfg.VoiceInputModeDefault = "transcript_first"
 	}
@@ -194,6 +202,9 @@ func loadEnv(cfg *Config) {
 	}
 	if v := firstNonEmptyEnv("WECLAW_AGENT_OS_API_KEY", "LONGCLAW_AGENT_OS_API_KEY"); v != "" {
 		cfg.AgentOSAPIKey = v
+	}
+	if v := os.Getenv("WECLAW_AGENT_OS_LAUNCH_POLICY"); v != "" {
+		cfg.AgentOSLaunchPolicy = v
 	}
 	if v := firstNonEmptyEnv("WECLAW_CANONICAL_USER_ID", "LONGCLAW_CANONICAL_USER_ID"); v != "" {
 		cfg.CanonicalUserID = v
@@ -269,6 +280,14 @@ func firstNonEmptyEnv(keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func defaultSaveDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "weclaw-workspace")
+	}
+	return filepath.Join(home, ".weclaw", "workspace")
 }
 
 // Save saves the configuration to disk.

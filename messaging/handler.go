@@ -54,6 +54,9 @@ const (
 	voiceModeTranscriptFirst      = "transcript_first"
 	voiceModeTranscriptPlusAudio  = "transcript_plus_audio_context"
 	voiceModeAudioAnalysisRequest = "audio_analysis_requested"
+	agentOSLaunchPolicyOff        = "off"
+	agentOSLaunchPolicyExplicit   = "explicit_only"
+	agentOSLaunchPolicyAutomatic  = "automatic"
 )
 
 // NewHandler creates a new message handler.
@@ -82,6 +85,58 @@ func (h *Handler) SetConfig(cfg *config.Config) {
 
 func (h *Handler) SetAgentOSEventSink(sink *AgentOSEventSink) {
 	h.agentOSEventSink = sink
+}
+
+func (h *Handler) weclawCanonicalUserID(userID string) string {
+	if h.cfg != nil && strings.TrimSpace(h.cfg.CanonicalUserID) != "" {
+		return strings.TrimSpace(h.cfg.CanonicalUserID)
+	}
+	return fmt.Sprintf("wechat:%s", userID)
+}
+
+func (h *Handler) syncSessionWindowMetadata(msg ilink.WeixinMessage) {
+	if h.saveDir == "" {
+		return
+	}
+	canonicalUserID := h.weclawCanonicalUserID(msg.FromUserID)
+	if err := obsidianarchive.UpdateSessionWindowMetadata(
+		h.saveDir,
+		msg.FromUserID,
+		"session:"+canonicalUserID,
+		canonicalUserID,
+		msg.ContextToken,
+	); err != nil {
+		log.Printf("[handler] failed to sync session metadata for %s: %v", msg.FromUserID, err)
+	}
+}
+
+func (h *Handler) agentOSLaunchPolicy() string {
+	if h.cfg == nil {
+		return agentOSLaunchPolicyOff
+	}
+	switch strings.ToLower(strings.TrimSpace(h.cfg.AgentOSLaunchPolicy)) {
+	case agentOSLaunchPolicyAutomatic:
+		return agentOSLaunchPolicyAutomatic
+	case agentOSLaunchPolicyExplicit:
+		return agentOSLaunchPolicyExplicit
+	default:
+		return agentOSLaunchPolicyOff
+	}
+}
+
+func (h *Handler) shouldAutoSubmitAgentOSLaunch(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	switch h.agentOSLaunchPolicy() {
+	case agentOSLaunchPolicyAutomatic:
+		return true
+	case agentOSLaunchPolicyExplicit:
+		return len(parseLaunchMentions(trimmed)) > 0
+	default:
+		return false
+	}
 }
 
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
@@ -336,6 +391,7 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 	if err := RememberContextToken(msg.FromUserID, msg.ContextToken); err != nil {
 		log.Printf("[handler] failed to persist context token for %s: %v", msg.FromUserID, err)
 	}
+	h.syncSessionWindowMetadata(msg)
 
 	var savedVoicePath string
 	var savedVoiceTranscript string
@@ -646,6 +702,9 @@ func (h *Handler) reportAgentOSIngress(msg ilink.WeixinMessage, text string) {
 }
 
 func (h *Handler) reportAgentOSLaunch(msg ilink.WeixinMessage, text string, targetAgents []string) {
+	if !h.shouldAutoSubmitAgentOSLaunch(text) {
+		return
+	}
 	go func() {
 		reqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -814,10 +873,6 @@ func (h *Handler) sendReplyWithMedia(ctx context.Context, client *ilink.Client, 
 		}
 	}
 
-	if h.saveDir != "" {
-		_ = obsidianarchive.RecordAgentReply(h.saveDir, msg.FromUserID, msg.MessageID, agentName, detail)
-	}
-
 	log.Printf("[handler] delivered reply to %s (agent=%s, text_chars=%d, image_urls=%d, attachments=%d, failed_attachments=%d)", msg.FromUserID, agentName, len([]rune(strings.TrimSpace(detail))), len(imageURLs), len(attachmentPaths), len(failedPaths))
 }
 
@@ -833,6 +888,10 @@ func (h *Handler) sendStructuredTextReply(ctx context.Context, client *ilink.Cli
 	reply := formatBrandedReply(agentName, detail, kind)
 	if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 		log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+	}
+	if h.saveDir != "" {
+		h.syncSessionWindowMetadata(msg)
+		_ = obsidianarchive.RecordAgentReply(h.saveDir, msg.FromUserID, msg.MessageID, agentName, detail)
 	}
 }
 

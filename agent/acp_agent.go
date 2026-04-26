@@ -730,6 +730,8 @@ func (a *ACPAgent) readLoop() {
 			a.handleCodexItemStarted(msg.Params)
 		case "turn/started", "turn/completed":
 			a.handleCodexTurnEvent(msg.Method, msg.Params)
+		case "error":
+			a.handleCodexError(msg.Params)
 		case "codex/event/agent_message", "codex/event/task_complete",
 			"codex/event/item_completed", "codex/event/token_count",
 			"item/completed", "thread/tokenUsage/updated",
@@ -884,6 +886,59 @@ func (a *ACPAgent) handleCodexTurnEvent(method string, params json.RawMessage) {
 	if method == "turn/completed" {
 		a.dispatchToTurnCh(p.ThreadID, &codexTurnEvent{Kind: "completed"})
 	}
+}
+
+// handleCodexError forwards app-server error notifications into the active turn.
+func (a *ACPAgent) handleCodexError(params json.RawMessage) {
+	var p struct {
+		ThreadID string `json:"threadId"`
+		Error    struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		log.Printf("[acp] failed to parse codex error: %v (raw: %s)", err, string(params))
+		return
+	}
+
+	message := extractCodexErrorMessage(p.Error.Message)
+	if message == "" {
+		message = "codex app-server error"
+	}
+	a.dispatchToTurnCh(p.ThreadID, &codexTurnEvent{Kind: "error", Text: message})
+}
+
+func extractCodexErrorMessage(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ""
+	}
+
+	var payload struct {
+		Message string `json:"message"`
+		Error   struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+		Type   string `json:"type"`
+		Status int    `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(message), &payload); err != nil {
+		return message
+	}
+	if nested := strings.TrimSpace(payload.Error.Message); nested != "" {
+		return nested
+	}
+	if top := strings.TrimSpace(payload.Message); top != "" {
+		return top
+	}
+	if payload.Error.Type != "" {
+		return payload.Error.Type
+	}
+	if payload.Type != "" {
+		return payload.Type
+	}
+	return message
 }
 
 // dispatchToTurnCh sends an event to the turn channel for a thread.

@@ -41,10 +41,13 @@ type MediaEntry struct {
 }
 
 type SessionWindow struct {
-	UserID    string         `json:"user_id"`
-	UpdatedAt string         `json:"updated_at"`
-	Messages  []SessionEntry `json:"messages"`
-	Media     []MediaEntry   `json:"media"`
+	UserID             string         `json:"user_id"`
+	CanonicalSessionID string         `json:"canonical_session_id,omitempty"`
+	CanonicalUserID    string         `json:"canonical_user_id,omitempty"`
+	ContextToken       string         `json:"context_token,omitempty"`
+	UpdatedAt          string         `json:"updated_at"`
+	Messages           []SessionEntry `json:"messages"`
+	Media              []MediaEntry   `json:"media"`
 }
 
 type SessionArchiveTask struct {
@@ -85,6 +88,26 @@ func RecordUserMessage(workspaceDir, userID string, messageID int64, text string
 		Text:      strings.TrimSpace(text),
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 	})
+	window.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return saveJSON(path, window)
+}
+
+func UpdateSessionWindowMetadata(
+	workspaceDir, userID, canonicalSessionID, canonicalUserID, contextToken string,
+) error {
+	window, path, err := loadSessionWindow(workspaceDir, userID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(canonicalSessionID) != "" {
+		window.CanonicalSessionID = strings.TrimSpace(canonicalSessionID)
+	}
+	if strings.TrimSpace(canonicalUserID) != "" {
+		window.CanonicalUserID = strings.TrimSpace(canonicalUserID)
+	}
+	if strings.TrimSpace(contextToken) != "" {
+		window.ContextToken = strings.TrimSpace(contextToken)
+	}
 	window.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	return saveJSON(path, window)
 }

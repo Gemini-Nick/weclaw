@@ -141,6 +141,36 @@ func TestRecordSessionEntriesDeduplicateRepeatedWrites(t *testing.T) {
 	}
 }
 
+func TestUpdateSessionWindowMetadata(t *testing.T) {
+	workspace := t.TempDir()
+	if err := UpdateSessionWindowMetadata(
+		workspace,
+		"user@im.wechat",
+		"session:wechat:user@im.wechat",
+		"wechat:user@im.wechat",
+		"ctx-123",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordUserMessage(workspace, "user@im.wechat", 30, "测试消息"); err != nil {
+		t.Fatal(err)
+	}
+
+	window, _, err := loadSessionWindow(workspace, "user@im.wechat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if window.CanonicalSessionID != "session:wechat:user@im.wechat" {
+		t.Fatalf("unexpected canonical session id: %#v", window.CanonicalSessionID)
+	}
+	if window.CanonicalUserID != "wechat:user@im.wechat" {
+		t.Fatalf("unexpected canonical user id: %#v", window.CanonicalUserID)
+	}
+	if window.ContextToken != "ctx-123" {
+		t.Fatalf("unexpected context token: %#v", window.ContextToken)
+	}
+}
+
 func TestQueueAndSyncSessionArchive_TranscriptOnlyVoiceSkipsAudioAsset(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := &config.Config{

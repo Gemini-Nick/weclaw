@@ -10,12 +10,12 @@ import (
 )
 
 const (
-	qrCodeURL     = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3"
-	qrStatusURL   = "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode="
-	statusWait     = "wait"
-	statusScanned  = "scaned"
+	qrCodeURL       = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3"
+	qrStatusURL     = "https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode="
+	statusWait      = "wait"
+	statusScanned   = "scaned"
 	statusConfirmed = "confirmed"
-	statusExpired  = "expired"
+	statusExpired   = "expired"
 )
 
 // FetchQRCode retrieves a new QR code for login.
@@ -155,18 +155,41 @@ func LoadAllCredentials() ([]*Credentials, error) {
 	}
 
 	var result []*Credentials
+	type credentialCandidate struct {
+		creds *Credentials
+		mtime time.Time
+	}
+	latestByUser := make(map[string]credentialCandidate)
+
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		path := filepath.Join(dir, e.Name())
+		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
 		var creds Credentials
-		if json.Unmarshal(data, &creds) == nil && creds.BotToken != "" {
-			result = append(result, &creds)
+		if json.Unmarshal(data, &creds) != nil || creds.BotToken == "" {
+			continue
 		}
+
+		userKey := creds.ILinkUserID
+		if userKey == "" {
+			userKey = creds.ILinkBotID
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		current, exists := latestByUser[userKey]
+		if !exists || info.ModTime().After(current.mtime) {
+			latestByUser[userKey] = credentialCandidate{creds: &creds, mtime: info.ModTime()}
+		}
+	}
+	for _, candidate := range latestByUser {
+		result = append(result, candidate.creds)
 	}
 	return result, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -124,6 +125,152 @@ func TestParseCommand_AtPrefix(t *testing.T) {
 	}
 	if msg != "explain this code" {
 		t.Errorf("expected 'explain this code', got %q", msg)
+	}
+}
+
+func TestShouldAutoSubmitAgentOSLaunch(t *testing.T) {
+	h := newTestHandler()
+	h.SetConfig(&config.Config{AgentOSLaunchPolicy: "off"})
+	if h.shouldAutoSubmitAgentOSLaunch("@pack signals.review 盘前摘要") {
+		t.Fatal("expected launch policy off to suppress automatic launch")
+	}
+
+	h.SetConfig(&config.Config{AgentOSLaunchPolicy: "explicit_only"})
+	if !h.shouldAutoSubmitAgentOSLaunch("@pack signals.review 盘前摘要") {
+		t.Fatal("expected explicit_only to allow explicit launch mentions")
+	}
+	if h.shouldAutoSubmitAgentOSLaunch("给我一份盘前摘要") {
+		t.Fatal("expected explicit_only to block free-text automatic launch")
+	}
+
+	h.SetConfig(&config.Config{AgentOSLaunchPolicy: "automatic"})
+	if !h.shouldAutoSubmitAgentOSLaunch("给我一份盘前摘要") {
+		t.Fatal("expected automatic launch policy to allow free-text launch")
+	}
+}
+
+func TestHandleMessage_WithLaunchPolicyOffRecordsIngressAndSessionButNotLaunch(t *testing.T) {
+	durableSeenMessagesRootOverride = t.TempDir()
+	t.Cleanup(func() { durableSeenMessagesRootOverride = "" })
+	contextTokensPathOverride = filepath.Join(t.TempDir(), "context_tokens.json")
+	t.Cleanup(func() { contextTokensPathOverride = "" })
+
+	var (
+		mu           sync.Mutex
+		ingressCount int
+		launchCount  int
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ilink/bot/getconfig":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ret":           0,
+				"typing_ticket": "ticket",
+			})
+		case "/ilink/bot/sendtyping":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
+		case "/ilink/bot/sendmessage":
+			var req ilink.SendMessageRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode sendmessage: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"ret": 0})
+		case "/agent-os/adapters/weclaw/ingest":
+			mu.Lock()
+			ingressCount++
+			mu.Unlock()
+			_, _ = io.Copy(io.Discard, r.Body)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		case "/agent-os/launches":
+			mu.Lock()
+			launchCount++
+			mu.Unlock()
+			_, _ = io.Copy(io.Discard, r.Body)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	ag := &fakeAgent{reply: "processed message"}
+	h := newTestHandler()
+	h.SetSaveDir(tmpDir)
+	h.SetConfig(&config.Config{
+		AgentOSBaseURL:        srv.URL,
+		AgentOSLaunchPolicy:   "off",
+		CanonicalUserID:       "wechat:canonical-user",
+		VoiceInputModeDefault: "transcript_first",
+	})
+	h.SetDefaultAgent("codex", ag)
+	h.SetAgentOSEventSink(NewAgentOSEventSink(srv.URL, "", "wechat:canonical-user", "", ""))
+
+	client := ilink.NewClient(&ilink.Credentials{
+		BaseURL:    srv.URL,
+		BotToken:   "token",
+		ILinkBotID: "bot@im.bot",
+	})
+
+	msg := ilink.WeixinMessage{
+		MessageID:    55,
+		FromUserID:   "user@im.wechat",
+		MessageType:  ilink.MessageTypeUser,
+		MessageState: ilink.MessageStateFinish,
+		ContextToken: "ctx-55",
+		ItemList: []ilink.MessageItem{
+			{Type: ilink.ItemTypeText, TextItem: &ilink.TextItem{Text: "帮我看下盘前摘要"}},
+		},
+	}
+
+	h.HandleMessage(context.Background(), client, msg)
+
+	if got := ag.lastMessage(); got == "" {
+		t.Fatal("expected agent dispatch for the inbound message")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		gotIngress := ingressCount
+		mu.Unlock()
+		if gotIngress > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	gotIngress := ingressCount
+	gotLaunch := launchCount
+	mu.Unlock()
+	if gotIngress != 1 {
+		t.Fatalf("expected 1 ingress submission, got %d", gotIngress)
+	}
+	if gotLaunch != 0 {
+		t.Fatalf("expected no launch submissions with policy off, got %d", gotLaunch)
+	}
+
+	sessionPath := filepath.Join(tmpDir, ".obsidian", "sessions", "user_im.wechat.json")
+	data, err := os.ReadFile(sessionPath)
+	if err != nil {
+		t.Fatalf("read session window: %v", err)
+	}
+	var windowState obsidianarchive.SessionWindow
+	if err := json.Unmarshal(data, &windowState); err != nil {
+		t.Fatalf("unmarshal session window: %v", err)
+	}
+	if windowState.CanonicalSessionID != "session:wechat:canonical-user" {
+		t.Fatalf("unexpected canonical session id: %q", windowState.CanonicalSessionID)
+	}
+	if windowState.CanonicalUserID != "wechat:canonical-user" {
+		t.Fatalf("unexpected canonical user id: %q", windowState.CanonicalUserID)
+	}
+	if windowState.ContextToken != "ctx-55" {
+		t.Fatalf("unexpected context token: %q", windowState.ContextToken)
+	}
+	if len(windowState.Messages) != 2 {
+		t.Fatalf("expected user and agent messages in session window, got %#v", windowState.Messages)
 	}
 }
 
