@@ -48,12 +48,18 @@ type AgentOSLaunchRequest struct {
 	TargetAgents []string `json:"target_agents,omitempty"`
 }
 
+type switchAgentRequest struct {
+	Agent string `json:"agent"`
+}
+
 // Run starts the HTTP server. Blocks until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/send", s.handleSend)
 	mux.HandleFunc("/api/task-dispatch", s.handleTaskDispatch)
 	mux.HandleFunc("/api/agent-os/launch", s.handleAgentOSLaunch)
+	mux.HandleFunc("/api/agents", s.handleAgents)
+	mux.HandleFunc("/api/switch-agent", s.handleSwitchAgent)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
@@ -235,5 +241,50 @@ func (s *Server) handleAgentOSLaunch(w http.ResponseWriter, r *http.Request) {
 		"from_user_id":  msg.FromUserID,
 		"message_id":    msg.MessageID,
 		"target_agents": req.TargetAgents,
+	})
+}
+
+func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.handler == nil {
+		http.Error(w, "handler unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	statuses := s.handler.GetAgentStatuses()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(statuses)
+}
+
+func (s *Server) handleSwitchAgent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.handler == nil {
+		http.Error(w, "handler unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req switchAgentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Agent == "" {
+		http.Error(w, `"agent" is required`, http.StatusBadRequest)
+		return
+	}
+
+	result := s.handler.SwitchDefault(r.Context(), req.Agent)
+	log.Printf("[api] agent switch requested: %s -> %s", req.Agent, result)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "ok",
+		"result": result,
 	})
 }

@@ -32,6 +32,16 @@ type AgentMeta struct {
 	Model   string
 }
 
+// AgentStatus is the public representation of an agent's current runtime state.
+type AgentStatus struct {
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Model     string `json:"model"`
+	Command   string `json:"command"`
+	IsDefault bool   `json:"is_default"`
+	IsRunning bool   `json:"is_running"`
+}
+
 // Handler processes incoming WeChat messages and dispatches replies.
 type Handler struct {
 	mu               sync.RWMutex
@@ -956,6 +966,49 @@ func (h *Handler) chatWithAgentWithTools(ctx context.Context, ag agent.Agent, ms
 		log.Printf("[obsidian] archive_intent_unhandled conversation_id=%s agent=%s", msg.FromUserID, agentName)
 	}
 	return result.Reply, nil
+}
+
+// GetAgentStatuses returns the current runtime status of all configured agents.
+func (h *Handler) GetAgentStatuses() []AgentStatus {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	var out []AgentStatus
+	seen := make(map[string]bool)
+	for _, meta := range h.agentMetas {
+		_, running := h.agents[meta.Name]
+		out = append(out, AgentStatus{
+			Name:      meta.Name,
+			Type:      meta.Type,
+			Model:     meta.Model,
+			Command:   meta.Command,
+			IsDefault: meta.Name == h.defaultName,
+			IsRunning: running,
+		})
+		seen[meta.Name] = true
+	}
+	// Also include running agents not yet registered in metas
+	for name := range h.agents {
+		if seen[name] {
+			continue
+		}
+		info := h.agents[name].Info()
+		out = append(out, AgentStatus{
+			Name:      name,
+			Type:      info.Type,
+			Model:     info.Model,
+			Command:   info.Command,
+			IsDefault: name == h.defaultName,
+			IsRunning: true,
+		})
+	}
+	return out
+}
+
+// SwitchDefault switches the default agent. Starts it on demand if needed.
+// The change is persisted to config file.
+func (h *Handler) SwitchDefault(ctx context.Context, name string) string {
+	return h.switchDefault(ctx, name)
 }
 
 // switchDefault switches the default agent. Starts it on demand if needed.
